@@ -62,6 +62,7 @@ fun IncomingCallScreen(
     onAccept: () -> Unit,
     onDecline: () -> Unit,
 ) {
+    val displayName = if (isKnock) "Someone" else peer.displayName ?: peer.phone ?: "Slide"
     val transition = rememberInfiniteTransition(label = "pulse")
     val pulse by transition.animateFloat(
         initialValue = 1f,
@@ -83,13 +84,13 @@ fun IncomingCallScreen(
     ) {
         Spacer(Modifier.weight(1f))
         AvatarCircle(
-            name = peer.displayName,
+            name = displayName,
             size = 128.dp,
             modifier = Modifier.scale(pulse),
         )
         Spacer(Modifier.height(24.dp))
         Text(
-            peer.displayName ?: peer.phone ?: "Slide",
+            displayName,
             color = SlideColors.Ink,
             fontWeight = FontWeight.Light,
             fontSize = 30.sp,
@@ -97,7 +98,7 @@ fun IncomingCallScreen(
         Spacer(Modifier.height(8.dp))
         Text(
             when {
-                isKnock -> "is knocking"
+                isKnock -> "is knocking — answer to find out who"
                 videoEnabled -> "Incoming video call"
                 else -> "Incoming call"
             },

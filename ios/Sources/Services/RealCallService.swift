@@ -41,13 +41,23 @@ final class RealCallService: NSObject, CallService, @unchecked Sendable {
         dynacast: true))
 
     private(set) var connectionState: CallConnectionState = .idle {
-        didSet { DispatchQueue.main.async { self.delegate?.callService(self, didChange: self.connectionState) } }
+        didSet {
+            let state = connectionState
+            DispatchQueue.main.async {
+                if self.isLeavingSnapshot, state != .ended { return }
+                self.delegate?.callService(self, didChange: state)
+            }
+        }
     }
     private(set) var hasRemoteVideo = false
     private(set) var isMuted = false
     private(set) var isVideoEnabled = true
     private(set) var isUsingFrontCamera = true
     private(set) var remoteParticipants: [RemoteParticipant] = []
+    private let lifecycleLock = NSLock()
+    private var lifecycleGeneration = 0
+    private var isLeaving = false
+    private var joinTask: Task<Void, Never>?
 
     override init() {
         super.init()
@@ -57,36 +67,113 @@ final class RealCallService: NSObject, CallService, @unchecked Sendable {
     // MARK: - Join
 
     func join(session: CallSession, videoEnabled: Bool) {
+        let generation = beginJoin()
         isVideoEnabled = videoEnabled
         connectionState = .connecting
         let url = session.sfuUrl
         let token = session.joinToken
-        Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
             do {
                 try await self.room.connect(url: url, token: token)
-                try await self.room.localParticipant.setMicrophone(enabled: true)
+                guard !Task.isCancelled, self.isCurrentJoin(generation) else {
+                    await self.room.disconnect()
+                    return
+                }
+                try await self.room.localParticipant.setMicrophone(enabled: !self.isMuted)
+                guard !Task.isCancelled, self.isCurrentJoin(generation) else {
+                    await self.room.disconnect()
+                    return
+                }
                 if videoEnabled {
-                    try await self.room.localParticipant.setCamera(enabled: true)
-                    Self.preferSpeakerIfOnEarpiece()
+                    // Camera denial should degrade a video invitation to audio,
+                    // not tear down a successfully connected/mic-enabled call.
+                    // Permission UI is handled before outgoing call creation;
+                    // a cold incoming answer cannot present it in background.
+                    if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+                        do {
+                            try await self.room.localParticipant.setCamera(enabled: true)
+                            guard !Task.isCancelled, self.isCurrentJoin(generation) else {
+                                await self.room.disconnect()
+                                return
+                            }
+                            Self.preferSpeakerIfOnEarpiece()
+                        } catch {
+                            if self.isCurrentJoin(generation) {
+                                self.isVideoEnabled = false
+                            }
+                        }
+                    } else {
+                        if self.isCurrentJoin(generation) {
+                            self.isVideoEnabled = false
+                        }
+                    }
+                }
+                guard !Task.isCancelled, self.isCurrentJoin(generation) else {
+                    await self.room.disconnect()
+                    return
                 }
             } catch {
-                self.connectionState = .failed("Couldn't connect")
+                await self.room.disconnect()
+                if self.isCurrentJoin(generation) {
+                    self.connectionState = .failed("Couldn't connect")
+                }
             }
         }
+        joinTask = task
+    }
+
+    private func beginJoin() -> Int {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        lifecycleGeneration += 1
+        isLeaving = false
+        return lifecycleGeneration
+    }
+
+    private func invalidateJoin() {
+        lifecycleLock.lock()
+        lifecycleGeneration += 1
+        isLeaving = true
+        lifecycleLock.unlock()
+    }
+
+    private func isCurrentJoin(_ generation: Int) -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return !isLeaving && lifecycleGeneration == generation
+    }
+
+    private func currentGenerationIfActive() -> Int? {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return isLeaving ? nil : lifecycleGeneration
+    }
+
+    private var isLeavingSnapshot: Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return isLeaving
     }
 
     // MARK: - Controls
 
     func setMuted(_ muted: Bool) {
+        guard let generation = currentGenerationIfActive() else { return }
         isMuted = muted
-        Task { try? await room.localParticipant.setMicrophone(enabled: !muted) }
+        Task { [weak self] in
+            guard let self, self.isCurrentJoin(generation) else { return }
+            try? await self.room.localParticipant.setMicrophone(enabled: !muted)
+        }
     }
 
     func setVideoEnabled(_ enabled: Bool) {
+        guard let generation = currentGenerationIfActive() else { return }
         isVideoEnabled = enabled
-        Task {
-            try? await room.localParticipant.setCamera(enabled: enabled)
+        Task { [weak self] in
+            guard let self, self.isCurrentJoin(generation) else { return }
+            try? await self.room.localParticipant.setCamera(enabled: enabled)
+            guard self.isCurrentJoin(generation) else { return }
             if enabled { Self.preferSpeakerIfOnEarpiece() }
         }
     }
@@ -100,6 +187,7 @@ final class RealCallService: NSObject, CallService, @unchecked Sendable {
     }
 
     func flipCamera() {
+        guard let generation = currentGenerationIfActive() else { return }
         // Set an explicit target instead of LiveKit's toggle — the toggle
         // derives "current" from device state and throws .unspecified during
         // capture (re)starts, which made flip a silent no-op.
@@ -107,13 +195,17 @@ final class RealCallService: NSObject, CallService, @unchecked Sendable {
         isUsingFrontCamera.toggle()
         Task { [weak self] in
             guard let self,
+                  self.isCurrentJoin(generation),
                   let track = self.room.localParticipant.firstCameraVideoTrack as? LocalVideoTrack,
                   let capturer = track.capturer as? CameraCapturer else { return }
             do {
                 try await capturer.set(cameraPosition: target)
+                guard self.isCurrentJoin(generation) else { return }
             } catch {
                 // Capture restart failed — revert so the next tap retries.
-                self.isUsingFrontCamera = (target != .front)
+                if self.isCurrentJoin(generation) {
+                    self.isUsingFrontCamera = (target != .front)
+                }
             }
         }
     }
@@ -131,6 +223,10 @@ final class RealCallService: NSObject, CallService, @unchecked Sendable {
     }
 
     func leave() {
+        guard !isLeavingSnapshot else { return }
+        invalidateJoin()
+        joinTask?.cancel()
+        joinTask = nil
         Task { @MainActor in CallPiPController.shared.detach() }
         Task { await room.disconnect() }
         remoteParticipants = []
@@ -141,6 +237,7 @@ final class RealCallService: NSObject, CallService, @unchecked Sendable {
     // MARK: - Roster
 
     private func rebuildParticipants() {
+        guard !isLeavingSnapshot else { return }
         let ps = Array(room.remoteParticipants.values)
         let mapped = ps.map { p in
             RemoteParticipant(
@@ -157,6 +254,7 @@ final class RealCallService: NSObject, CallService, @unchecked Sendable {
     }
 
     private func refreshRemoteVideoState() {
+        guard !isLeavingSnapshot else { return }
         let anyVideo = room.remoteParticipants.values.contains { $0.firstCameraVideoTrack != nil }
         hasRemoteVideo = anyVideo
         let pipTrack = room.remoteParticipants.values.compactMap { $0.firstCameraVideoTrack }.first
@@ -181,16 +279,19 @@ extension RealCallService: RoomDelegate {
               from oldConnectionState: ConnectionState) {
         switch connectionState {
         case .connecting:
+            guard !isLeavingSnapshot else { return }
             self.connectionState = .connecting
         case .reconnecting:
+            guard !isLeavingSnapshot else { return }
             self.connectionState = .reconnecting
         case .connected:
+            guard !isLeavingSnapshot else { return }
             self.connectionState = .connected
         case .disconnected:
-            // A clean disconnect after a real session = call ended; otherwise it
-            // never connected → surface a failure.
-            let wasUp = oldConnectionState == .connected || oldConnectionState == .reconnecting
-            self.connectionState = wasUp ? .ended : .failed("Disconnected")
+            // Only an explicit local leave is a clean end. Losing the room after
+            // it was connected is recoverable/failable UI, not a terminal event
+            // that leaves the call screen stuck with no retry affordance.
+            self.connectionState = isLeavingSnapshot ? .ended : .failed("Disconnected")
         case .disconnecting:
             break
         @unknown default:

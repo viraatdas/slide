@@ -13,7 +13,7 @@ import {
 import PhoneField from "./PhoneField";
 import { KnockSurface, KnockIncoming, playKnock, vibrateKnock } from "./Knock";
 import { Room, RoomEvent, Track, VideoPresets, type RemoteTrack } from "livekit-client";
-import { enableWebPush } from "../lib/push";
+import { disableWebPush, enableWebPush } from "../lib/push";
 import { firebaseAuth } from "../lib/firebase";
 import {
   RecaptchaVerifier,
@@ -68,6 +68,8 @@ type Call = {
   status?: string;
   videoEnabled?: boolean;
   ringStyle?: string;
+  createdAt?: string;
+  expiresAt?: string | number;
   participants?: CallParticipant[];
 };
 
@@ -101,6 +103,7 @@ type SignalEvent = {
   videoEnabled?: boolean | string;
   ringStyle?: string;
   knock?: boolean | string;
+  expiresAt?: string | number;
   call?: Call;
   from?: string | User;
 };
@@ -111,6 +114,7 @@ type IncomingCall = {
   fromName: string;
   video: boolean;
   ringStyle: string;
+  expiresAt?: number;
 };
 
 type ActiveCall = {
@@ -120,6 +124,14 @@ type ActiveCall = {
   video: boolean;
   phone?: string | null;
   userId?: string | null;
+};
+
+type KnockSession = {
+  userId: string;
+  /** Name shown while tapping; remains anonymous for an incoming knock-back. */
+  name: string;
+  /** Identity retained internally and revealed only when the user places a call. */
+  identityName: string;
 };
 
 type Contact = {
@@ -148,6 +160,20 @@ type LookupState =
   | { status: "not-found" }
   | { status: "self" }
   | { status: "error"; message: string };
+
+type TerminalEventType = "call_accepted" | "call_declined" | "call_ended";
+type PushRegistrationState = "idle" | "registering" | "registered" | "failed";
+
+const TERMINAL_TOMBSTONE_TTL_MS = 5 * 60 * 1000;
+const MAX_TERMINAL_TOMBSTONES = 128;
+const volatileCallAcceptKeys = new Map<string, string>();
+
+class StaleCallOperationError extends Error {
+  constructor() {
+    super("Call operation is no longer current");
+    this.name = "StaleCallOperationError";
+  }
+}
 
 function storedTokens(): AuthTokens | null {
   if (typeof window === "undefined") return null;
@@ -302,16 +328,107 @@ async function jsonFetch<T>(
   return (await response.json()) as T;
 }
 
+/**
+ * Fire a terminal call mutation with the current bearer token and `keepalive`.
+ * This deliberately bypasses token refresh so logout/unload can start the
+ * request before local credentials are cleared and let the browser finish it.
+ */
+function bestEffortCallResolution(
+  callId: string,
+  action: "leave" | "decline",
+  accessToken: string | null,
+) {
+  if (!callId || !accessToken) return;
+  const headers: Record<string, string> = { Authorization: `Bearer ${accessToken}` };
+  if (action === "leave") headers["X-Call-Accept-Key"] = callAcceptKey(callId);
+  void fetch(apiUrl(`/calls/${callId}/${action}`), {
+    method: "POST",
+    headers,
+    keepalive: true,
+  }).catch(() => undefined);
+}
+
+function callAcceptKey(callId: string): string {
+  const storageKey = `slide.web.callAcceptKey.${callId}`;
+  const inMemory = volatileCallAcceptKeys.get(callId);
+  if (inMemory) return inMemory;
+  try {
+    const existing = window.sessionStorage.getItem(storageKey);
+    if (existing && /^[A-Za-z0-9_-]{8,128}$/.test(existing)) {
+      volatileCallAcceptKeys.set(callId, existing);
+      return existing;
+    }
+  } catch {
+    // Some embedded/private contexts block storage; retain the key in memory.
+  }
+  // Per-call + per-tab is intentional. A localStorage key shared by two tabs
+  // would make the server treat both as an idempotent retry and issue two media
+  // tokens. sessionStorage survives reload but isolates independently opened tabs.
+  const generated =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random()
+          .toString(36)
+          .slice(2)}`;
+  volatileCallAcceptKeys.set(callId, generated);
+  try {
+    window.sessionStorage.setItem(storageKey, generated);
+  } catch {
+    // The in-memory key still makes retries safe for this page lifetime.
+  }
+  return generated;
+}
+
+function isAnsweredElsewhereError(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status === 409 &&
+    /answered on another installation/i.test(error.message)
+  );
+}
+
+function isActionableUserId(value: string | null | undefined): value is string {
+  return Boolean(
+    value &&
+      value !== "unknown" &&
+      value !== "00000000-0000-0000-0000-000000000000",
+  );
+}
+
+async function reconcileAmbiguousAccept(
+  callId: string,
+  acceptKey: string,
+  accessToken: string,
+) {
+  for (const delay of [700, 1400, 2800]) {
+    await new Promise((resolve) => window.setTimeout(resolve, delay));
+    try {
+      await jsonFetch<CallSession>(`/calls/${callId}/accept`, accessToken, {
+        method: "POST",
+        headers: { "X-Call-Accept-Key": acceptKey },
+      });
+      // This key owns the accepted participant (either from the original request
+      // or this retry). The UI abandoned it, so close only our confirmed winner.
+      bestEffortCallResolution(callId, "leave", accessToken);
+      return;
+    } catch (error) {
+      if (isAnsweredElsewhereError(error)) return;
+      if (error instanceof ApiError && error.status < 500) return;
+    }
+  }
+}
+
 function incomingFrom(event: SignalEvent): IncomingCall | null {
   const callId = event.callId ?? event.call?.id;
   if (!callId) return null;
   const fromObject = typeof event.from === "object" ? event.from : null;
-  const fromUserId =
+  const rawFromUserId =
     event.fromUserId ??
     (typeof event.from === "string" ? event.from : undefined) ??
     fromObject?.id ??
     event.call?.createdBy ??
     "unknown";
+  const fromUserId = isActionableUserId(rawFromUserId) ? rawFromUserId : "";
   const fromName =
     event.fromName ??
     fromObject?.displayName ??
@@ -323,7 +440,8 @@ function incomingFrom(event: SignalEvent): IncomingCall | null {
   const isKnock = event.knock === true || event.knock === "true";
   const ringStyle =
     event.ringStyle ?? event.call?.ringStyle ?? (isKnock ? "knock" : "call");
-  return { callId, fromUserId, fromName, video, ringStyle };
+  const expiresAt = parseExpiresAt(event.expiresAt ?? event.call?.expiresAt);
+  return { callId, fromUserId, fromName, video, ringStyle, expiresAt };
 }
 
 function incomingFromCall(call: Call, currentUserId: string): IncomingCall | null {
@@ -332,11 +450,24 @@ function incomingFromCall(call: Call, currentUserId: string): IncomingCall | nul
   const caller = call.participants?.find((participant) => participant.userId === call.createdBy);
   return {
     callId: call.id,
-    fromUserId: call.createdBy ?? caller?.userId ?? "unknown",
+    fromUserId: isActionableUserId(call.createdBy ?? caller?.userId)
+      ? (call.createdBy ?? caller?.userId ?? "")
+      : "",
     fromName: caller?.displayName ?? caller?.phone ?? "Slide",
     video: call.videoEnabled ?? true,
     ringStyle: call.ringStyle ?? "call",
+    expiresAt: parseExpiresAt(call.expiresAt),
   };
+}
+
+function parseExpiresAt(value: string | number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function invitationExpired(call: IncomingCall): boolean {
+  return call.expiresAt !== undefined && call.expiresAt <= Date.now();
 }
 
 function serverContactToContact(contact: ServerContact): Contact | null {
@@ -406,7 +537,7 @@ export default function SlideWebApp() {
   // Knock: real-time "tap a rhythm" presence ritual. `knockSession` is the
   // full-screen duet stage; `knockTheirPulse` ticks when the peer in that
   // session knocks back so their ripple blooms on our stage.
-  const [knockSession, setKnockSession] = useState<{ userId: string; name: string } | null>(null);
+  const [knockSession, setKnockSession] = useState<KnockSession | null>(null);
   const [knockTheirPulse, setKnockTheirPulse] = useState(0);
   const [knocking, setKnocking] = useState<{
     fromUserId: string;
@@ -415,6 +546,8 @@ export default function SlideWebApp() {
   } | null>(null);
   const [activeCall, setActiveCall] = useState<ActiveCall | null>(null);
   const [notificationState, setNotificationState] = useState("default");
+  const [pushRegistrationState, setPushRegistrationState] =
+    useState<PushRegistrationState>("idle");
   const [status, setStatus] = useState("Ready");
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
@@ -440,11 +573,26 @@ export default function SlideWebApp() {
   const everConnectedRef = useRef(false);
   const incomingRef = useRef<IncomingCall | null>(null);
   const activeCallRef = useRef<ActiveCall | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const terminalCallsRef = useRef<
+    Map<string, { expiresAt: number; type: TerminalEventType }>
+  >(new Map());
+  const mediaOperationRef = useRef<{ generation: number; callId: string | null }>({
+    generation: 0,
+    callId: null,
+  });
+  const outgoingCallGenerationRef = useRef<number | null>(null);
+  const pushRegistrationInFlight = useRef<Promise<boolean> | null>(null);
+  const pushRegistrationEpochRef = useRef(0);
+  // Distinguishes this tab's in-flight answer from a sibling installation's
+  // `call_accepted` event. The latter should dismiss our ringing UI; the
+  // former is only an idempotent confirmation.
+  const acceptingCallIdRef = useRef<string | null>(null);
   const knockSeq = useRef(0);
   const knockLastTap = useRef<number | null>(null);
   const knockClearTimer = useRef<number | null>(null);
-  const knockNotifyAt = useRef(0);
-  const knockSessionRef = useRef<{ userId: string; name: string } | null>(null);
+  const knockSessionRef = useRef<KnockSession | null>(null);
 
   const signedIn = Boolean(tokens && user);
 
@@ -522,6 +670,49 @@ export default function SlideWebApp() {
     [refreshAccessToken, applyTokens],
   );
 
+  const registerWebPush = useCallback(async (): Promise<boolean> => {
+    if (
+      !tokensRef.current ||
+      typeof Notification === "undefined" ||
+      Notification.permission !== "granted"
+    ) {
+      setPushRegistrationState("idle");
+      return false;
+    }
+    if (pushRegistrationInFlight.current) {
+      return pushRegistrationInFlight.current;
+    }
+
+    const epoch = pushRegistrationEpochRef.current;
+    setPushRegistrationState("registering");
+    const attempt = enableWebPush((subscription) =>
+      authedFetch("/push/register", {
+        method: "POST",
+        body: JSON.stringify({
+          pushToken: subscription.endpoint,
+          kind: "webpush",
+          p256dh: subscription.p256dh,
+          auth: subscription.auth,
+          platform: "web",
+          appVersion: "web",
+        }),
+      }),
+    ).then((registered) => {
+      if (pushRegistrationEpochRef.current === epoch && tokensRef.current) {
+        setPushRegistrationState(registered ? "registered" : "failed");
+      }
+      return registered;
+    });
+    pushRegistrationInFlight.current = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (pushRegistrationInFlight.current === attempt) {
+        pushRegistrationInFlight.current = null;
+      }
+    }
+  }, [authedFetch]);
+
   // Return a token guaranteed fresh for ~the next minute, refreshing if the
   // current one is expired or about to expire. Used before opening the socket.
   const ensureFreshToken = useCallback(async (): Promise<string | null> => {
@@ -547,6 +738,16 @@ export default function SlideWebApp() {
       .catch(() => applyTokens(null));
   }, [tokens, authedFetch, applyTokens]);
 
+  // Permission survives browser sessions, but backend registration may not
+  // (logout, token ownership transfer, endpoint rotation). Re-assert the
+  // current subscription after every successful sign-in without prompting.
+  useEffect(() => {
+    if (!signedIn || typeof Notification === "undefined") return;
+    if (Notification.permission === "granted") {
+      void registerWebPush();
+    }
+  }, [registerWebPush, signedIn, user?.id]);
+
   useEffect(() => {
     incomingRef.current = incoming;
   }, [incoming]);
@@ -556,9 +757,90 @@ export default function SlideWebApp() {
     setActiveCall(next);
   }, []);
 
+  const rememberTerminalCall = useCallback(
+    (callId: string, type: TerminalEventType = "call_ended") => {
+      const tombstones = terminalCallsRef.current;
+      const now = Date.now();
+      for (const [id, tombstone] of tombstones) {
+        if (tombstone.expiresAt <= now) tombstones.delete(id);
+      }
+      const existing = tombstones.get(callId);
+      if (
+        type === "call_accepted" &&
+        existing &&
+        existing.type !== "call_accepted"
+      ) {
+        return;
+      }
+      // Refresh insertion order for duplicate provider/WS terminal delivery.
+      tombstones.delete(callId);
+      tombstones.set(callId, {
+        expiresAt: now + TERMINAL_TOMBSTONE_TTL_MS,
+        type,
+      });
+      while (tombstones.size > MAX_TERMINAL_TOMBSTONES) {
+        const oldest = tombstones.keys().next().value as string | undefined;
+        if (!oldest) break;
+        tombstones.delete(oldest);
+      }
+    },
+    [],
+  );
+
+  const isTerminalCall = useCallback((callId: string) => {
+    const tombstone = terminalCallsRef.current.get(callId);
+    if (tombstone === undefined) return false;
+    if (tombstone.expiresAt <= Date.now()) {
+      terminalCallsRef.current.delete(callId);
+      return false;
+    }
+    return true;
+  }, []);
+
+  const beginMediaOperation = useCallback((callId: string | null) => {
+    const generation = mediaOperationRef.current.generation + 1;
+    mediaOperationRef.current = { generation, callId };
+    return generation;
+  }, []);
+
+  const bindMediaOperation = useCallback(
+    (generation: number, callId: string) => {
+      if (mediaOperationRef.current.generation !== generation) return false;
+      mediaOperationRef.current = { generation, callId };
+      return !isTerminalCall(callId);
+    },
+    [isTerminalCall],
+  );
+
+  const isCurrentMediaOperation = useCallback(
+    (generation: number, callId: string) =>
+      mediaOperationRef.current.generation === generation &&
+      mediaOperationRef.current.callId === callId &&
+      !isTerminalCall(callId),
+    [isTerminalCall],
+  );
+
+  const invalidateMediaOperation = useCallback((callId?: string) => {
+    const current = mediaOperationRef.current;
+    if (callId !== undefined && current.callId !== callId) return false;
+    mediaOperationRef.current = {
+      generation: current.generation + 1,
+      callId: null,
+    };
+    return true;
+  }, []);
+
   useEffect(() => {
     activeCallRef.current = activeCall;
   }, [activeCall]);
+
+  useEffect(() => {
+    localStreamRef.current = localStream;
+  }, [localStream]);
+
+  useEffect(() => {
+    remoteStreamRef.current = remoteStream;
+  }, [remoteStream]);
 
   useEffect(() => {
     knockSessionRef.current = knockSession;
@@ -632,17 +914,216 @@ export default function SlideWebApp() {
     ringTimer.current = window.setInterval(cycle, 2200);
   }, [ensureAudio, stopRingtone]);
 
-  const showNotification = useCallback((call: IncomingCall) => {
-    if (typeof Notification === "undefined" || Notification.permission !== "granted") {
-      return;
-    }
-    const isKnock = call.ringStyle === "knock";
-    new Notification(isKnock ? `${call.fromName} is knocking` : "Incoming Slide call", {
-      body: isKnock ? "Open Slide to answer." : `${call.fromName} is calling your browser.`,
-      icon: "/icon.svg",
-      tag: `slide-${call.callId}`,
+  const recordRecent = useCallback((call: RecentCall) => {
+    setRecents((current) => {
+      if (current.some((entry) => entry.id === call.id)) return current;
+      const next = [call, ...current].slice(0, 20);
+      saveList("slide.web.recents", next);
+      return next;
     });
   }, []);
+
+  const endCall = useCallback(
+    (notifyServer = true, expectedCallId?: string) => {
+      const currentCall = activeCallRef.current;
+      const operationMatches =
+        expectedCallId !== undefined &&
+        mediaOperationRef.current.callId === expectedCallId;
+      if (
+        expectedCallId !== undefined &&
+        currentCall?.callId !== expectedCallId &&
+        !operationMatches
+      ) {
+        return;
+      }
+
+      stopRingtone();
+      const callId = currentCall?.callId ?? expectedCallId;
+      if (callId) {
+        rememberTerminalCall(callId, "call_ended");
+        invalidateMediaOperation(callId);
+      } else {
+        invalidateMediaOperation();
+      }
+
+      // Null the ref first so LiveKit's Disconnected handler cannot re-enter.
+      const lkRoom = room.current;
+      room.current = null;
+      lkRoom?.localParticipant.trackPublications.forEach((publication) => {
+        publication.track?.mediaStreamTrack.stop();
+      });
+      lkRoom?.disconnect();
+      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+      remoteStreamRef.current?.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+      remoteStreamRef.current = null;
+
+      if (currentCall) {
+        const connected = everConnectedRef.current;
+        const startedAt = callStartRef.current ?? Date.now();
+        recordRecent({
+          id: `${currentCall.callId}-${startedAt}`,
+          peerName: currentCall.peerName,
+          phone: currentCall.phone,
+          userId: currentCall.userId,
+          direction: currentCall.direction,
+          video: currentCall.video,
+          startedAt,
+          durationSec: connected ? Math.round((Date.now() - startedAt) / 1000) : 0,
+          connected,
+        });
+      }
+      if (notifyServer && tokensRef.current && currentCall) {
+        void authedFetch(`/calls/${currentCall.callId}/leave`, {
+          method: "POST",
+          headers: { "X-Call-Accept-Key": callAcceptKey(currentCall.callId) },
+        }).catch(() => undefined);
+      }
+      callStartRef.current = null;
+      everConnectedRef.current = false;
+      setPeerConnected(false);
+      setRemoteVideoReady(false);
+      setLocalStream(null);
+      setRemoteStream(null);
+      setCurrentActiveCall(null);
+      setStatus("Ready");
+    },
+    [
+      authedFetch,
+      invalidateMediaOperation,
+      recordRecent,
+      rememberTerminalCall,
+      setCurrentActiveCall,
+      stopRingtone,
+    ],
+  );
+
+  const handleTerminalEvent = useCallback(
+    (type: TerminalEventType, callId: string) => {
+      if (type === "call_accepted") {
+        const acceptedHere =
+          acceptingCallIdRef.current === callId ||
+          activeCallRef.current?.callId === callId;
+        if (acceptedHere) return;
+
+        rememberTerminalCall(callId, "call_accepted");
+        invalidateMediaOperation(callId);
+        if (incomingRef.current?.callId === callId) {
+          stopRingtone();
+          incomingRef.current = null;
+          setIncoming(null);
+          setStatus("Answered on another device");
+        }
+        return;
+      }
+
+      rememberTerminalCall(callId, type);
+      invalidateMediaOperation(callId);
+      const ringing = incomingRef.current;
+      const wasAccepting = acceptingCallIdRef.current === callId;
+      if (ringing?.callId === callId && activeCallRef.current?.callId !== callId) {
+        recordRecent({
+          id: `${callId}-missed`,
+          peerName: ringing.fromName,
+          userId: ringing.fromUserId,
+          direction: "incoming",
+          video: ringing.video,
+          startedAt: Date.now(),
+          durationSec: 0,
+          connected: false,
+        });
+        stopRingtone();
+        incomingRef.current = null;
+        setIncoming(null);
+        setStatus("Ready");
+      }
+      if (activeCallRef.current?.callId === callId) {
+        endCall(false, callId);
+      } else if (wasAccepting) {
+        setStatus("Ready");
+      }
+    },
+    [
+      endCall,
+      invalidateMediaOperation,
+      recordRecent,
+      rememberTerminalCall,
+      stopRingtone,
+    ],
+  );
+
+  const presentIncomingCall = useCallback(
+    (next: IncomingCall) => {
+      if (!tokensRef.current) return false;
+      if (isTerminalCall(next.callId)) return false;
+      if (invitationExpired(next)) {
+        rememberTerminalCall(next.callId);
+        void authedFetch(`/calls/${next.callId}/decline`, { method: "POST" }).catch(
+          () => undefined,
+        );
+        if (incomingRef.current?.callId === next.callId) {
+          stopRingtone();
+          incomingRef.current = null;
+          setIncoming(null);
+        }
+        return false;
+      }
+
+      const currentCall = activeCallRef.current;
+      const currentIncoming = incomingRef.current;
+      if (acceptingCallIdRef.current === next.callId) return true;
+      if (
+        outgoingCallGenerationRef.current !== null ||
+        acceptingCallIdRef.current !== null ||
+        (currentCall && currentCall.callId !== next.callId) ||
+        (currentIncoming && currentIncoming.callId !== next.callId)
+      ) {
+        rememberTerminalCall(next.callId);
+        void authedFetch(`/calls/${next.callId}/decline`, { method: "POST" }).catch(
+          () => undefined,
+        );
+        return false;
+      }
+      if (currentIncoming?.callId === next.callId) return true;
+
+      if (next.ringStyle === "knock") {
+        if (knockClearTimer.current) {
+          window.clearTimeout(knockClearTimer.current);
+          knockClearTimer.current = null;
+        }
+        setKnocking(null);
+      }
+      incomingRef.current = next;
+      setIncoming(next);
+      setStatus("Incoming call");
+      playRingtone();
+      return true;
+    },
+    [
+      authedFetch,
+      isTerminalCall,
+      playRingtone,
+      rememberTerminalCall,
+      stopRingtone,
+    ],
+  );
+
+  useEffect(() => {
+    if (!incoming?.expiresAt) return;
+    const delay = Math.max(0, incoming.expiresAt - Date.now());
+    const callId = incoming.callId;
+    const timer = window.setTimeout(() => {
+      if (incomingRef.current?.callId !== callId) return;
+      rememberTerminalCall(callId);
+      incomingRef.current = null;
+      setIncoming(null);
+      stopRingtone();
+      void authedFetch(`/calls/${callId}/decline`, { method: "POST" }).catch(
+        () => undefined,
+      );
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [authedFetch, incoming, rememberTerminalCall, stopRingtone]);
 
   const hydrateIncomingCalls = useCallback(
     async (preferredCallId?: string | null) => {
@@ -650,7 +1131,10 @@ export default function SlideWebApp() {
       const response = await authedFetch<HistoryResponse>("/calls?limit=20");
       const incomingCalls = response.calls
         .map((call) => incomingFromCall(call, user.id))
-        .filter((call): call is IncomingCall => Boolean(call));
+        .filter(
+          (call): call is IncomingCall =>
+            call !== null && !isTerminalCall(call.callId),
+        );
       const next =
         incomingCalls.find((call) => call.callId === preferredCallId) ?? incomingCalls[0];
       if (!next) {
@@ -659,31 +1143,49 @@ export default function SlideWebApp() {
         }
         return false;
       }
-      setIncoming(next);
-      incomingRef.current = next;
-      setStatus("Incoming call");
-      playRingtone();
-      return true;
+      return presentIncomingCall(next);
     },
-    [authedFetch, playRingtone, user?.id],
+    [authedFetch, isTerminalCall, presentIncomingCall, user?.id],
   );
 
   useEffect(() => {
     if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
     const onMessage = (event: MessageEvent) => {
-      const message = event.data as { type?: string; call?: SignalEvent } | null;
-      if (message?.type !== "slide-notification-click") return;
-      const next = message.call ? incomingFrom(message.call) : null;
-      if (next) {
-        setIncoming(next);
-        incomingRef.current = next;
-        setStatus("Incoming call");
+      const message = event.data as
+        | { type?: string; call?: SignalEvent; eventType?: string; callId?: string }
+        | null;
+      if (!message) return;
+
+      if (message.type === "slide-call-terminal") {
+        const terminalType = message.eventType as TerminalEventType | undefined;
+        const callId = message.callId ?? message.call?.callId;
+        if (
+          callId &&
+          (terminalType === "call_accepted" ||
+            terminalType === "call_declined" ||
+            terminalType === "call_ended")
+        ) {
+          handleTerminalEvent(terminalType, callId);
+        }
+        return;
       }
-      void hydrateIncomingCalls(next?.callId ?? message.call?.callId).catch(() => undefined);
+
+      if (
+        message.type !== "slide-notification-click" &&
+        message.type !== "slide-push-event" &&
+        message.type !== "slide-stale-invitation"
+      ) {
+        return;
+      }
+      const next = message.call ? incomingFrom(message.call) : null;
+      if (next) presentIncomingCall(next);
+      void hydrateIncomingCalls(next?.callId ?? message.call?.callId).catch(
+        () => undefined,
+      );
     };
     navigator.serviceWorker.addEventListener("message", onMessage);
     return () => navigator.serviceWorker.removeEventListener("message", onMessage);
-  }, [hydrateIncomingCalls]);
+  }, [handleTerminalEvent, hydrateIncomingCalls, presentIncomingCall]);
 
   useEffect(() => {
     if (!signedIn || typeof window === "undefined") return;
@@ -722,15 +1224,6 @@ export default function SlideWebApp() {
     setContacts(onSlideContacts);
   }, [authedFetch]);
 
-  const recordRecent = useCallback((call: RecentCall) => {
-    setRecents((current) => {
-      if (current.some((entry) => entry.id === call.id)) return current;
-      const next = [call, ...current].slice(0, 20);
-      saveList("slide.web.recents", next);
-      return next;
-    });
-  }, []);
-
   useEffect(() => {
     if (!signedIn) return;
     void refreshContacts().catch(() => undefined);
@@ -750,7 +1243,15 @@ export default function SlideWebApp() {
     let cancelled = false;
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
+    let heartbeatTimer: number | null = null;
     let attempts = 0;
+
+    const clearHeartbeat = () => {
+      if (heartbeatTimer !== null) {
+        window.clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
 
     const scheduleReconnect = () => {
       if (cancelled || !tokensRef.current) return;
@@ -769,8 +1270,15 @@ export default function SlideWebApp() {
       ws.onopen = () => {
         attempts = 0;
         setStatus("Browser calls are online");
+        clearHeartbeat();
+        heartbeatTimer = window.setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "heartbeat" }));
+          }
+        }, 25000);
       };
       ws.onclose = () => {
+        clearHeartbeat();
         if (cancelled) return;
         setStatus("Browser calls are offline");
         scheduleReconnect();
@@ -791,18 +1299,28 @@ export default function SlideWebApp() {
         if (event.type === "incoming_call") {
           const next = incomingFrom(event);
           if (!next) return;
-          setIncoming(next);
-          setStatus("Incoming call");
-          playRingtone();
-          showNotification(next);
+          presentIncomingCall(next);
+          return;
         }
         if (event.type === "knock") {
-          const fromUserId = event.fromUserId ?? "";
+          const fromUserId = isActionableUserId(event.fromUserId) ? event.fromUserId : "";
           const fromName = event.fromName ?? "Someone";
           // Every tap feels + sounds, with gentle pitch variation so a rhythm
           // reads as musical rather than robotic.
           playKnock(ensureAudio(), 0.9 + Math.random() * 0.2);
           vibrateKnock();
+
+          // Anonymous live beats commonly race just ahead of their durable
+          // knock invitation. Once the answer surface exists, keep the rhythm
+          // feedback but never cover its controls with a raw-tap overlay.
+          if (
+            incomingRef.current?.ringStyle === "knock" ||
+            activeCallRef.current !== null ||
+            outgoingCallGenerationRef.current !== null ||
+            acceptingCallIdRef.current !== null
+          ) {
+            return;
+          }
 
           // If we're already in the duet stage with this person, land their tap
           // there (a blooming ripple) instead of popping the incoming card.
@@ -816,53 +1334,18 @@ export default function SlideWebApp() {
             fromName,
             pulse: (cur?.fromUserId === fromUserId ? cur.pulse : 0) + 1,
           }));
-          // Fire a system notification once per knock burst (a fresh burst starts
-          // after a >2s gap) so a knock reaches you even when the tab is in the
-          // background; the per-tap sound + vibration carry the rhythm.
-          const nowMs = Date.now();
-          if (nowMs - knockNotifyAt.current > 2000) {
-            knockNotifyAt.current = nowMs;
-            if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-              try {
-                new Notification(`${fromName} is knocking`, {
-                  tag: "slide-knock",
-                  renotify: true,
-                  silent: false,
-                } as NotificationOptions);
-              } catch {
-                // Some browsers only allow notifications from a service worker.
-              }
-            }
-          }
           if (knockClearTimer.current) window.clearTimeout(knockClearTimer.current);
           knockClearTimer.current = window.setTimeout(() => setKnocking(null), 4000);
         }
+        if (event.type === "call_accepted") {
+          const eventCallId = event.callId ?? event.call?.id;
+          if (eventCallId) handleTerminalEvent("call_accepted", eventCallId);
+          return;
+        }
         if (event.type === "call_ended" || event.type === "call_declined") {
-          const ringing = incomingRef.current;
-          const matchesRinging =
-            ringing &&
-            (ringing.callId === event.callId || ringing.callId === event.call?.id);
-          if (matchesRinging && !activeCallRef.current) {
-            recordRecent({
-              id: `${ringing!.callId}-missed`,
-              peerName: ringing!.fromName,
-              userId: ringing!.fromUserId,
-              direction: "incoming",
-              video: ringing.video,
-              startedAt: Date.now(),
-              durationSec: 0,
-              connected: false,
-            });
-          }
-          setIncoming((current) =>
-            current?.callId === event.callId || current?.callId === event.call?.id
-              ? null
-              : current,
-          );
-          const currentCall = activeCallRef.current;
-          if (currentCall?.callId === event.callId || currentCall?.callId === event.call?.id) {
-            endCall(false);
-          }
+          const eventCallId = event.callId ?? event.call?.id;
+          if (eventCallId) handleTerminalEvent(event.type, eventCallId);
+          return;
         }
       };
     };
@@ -872,16 +1355,18 @@ export default function SlideWebApp() {
     return () => {
       cancelled = true;
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      clearHeartbeat();
       socket?.close();
       signalingSocket.current = null;
     };
   }, [
+    authedFetch,
     ensureAudio,
     ensureFreshToken,
     playRingtone,
+    presentIncomingCall,
     refreshContacts,
-    recordRecent,
-    showNotification,
+    handleTerminalEvent,
     tokens,
   ]);
 
@@ -912,13 +1397,16 @@ export default function SlideWebApp() {
   );
 
   // Open the full-screen duet stage for a person (also used by "knock back").
-  const openKnock = useCallback((userId: string, name: string) => {
-    knockSeq.current = 0;
-    knockLastTap.current = null;
-    setKnockTheirPulse(0);
-    setKnocking(null);
-    setKnockSession({ userId, name });
-  }, []);
+  const openKnock = useCallback(
+    (userId: string, name: string, identityName: string = name) => {
+      knockSeq.current = 0;
+      knockLastTap.current = null;
+      setKnockTheirPulse(0);
+      setKnocking(null);
+      setKnockSession({ userId, name, identityName });
+    },
+    [],
+  );
 
   // Firebase phone auth: send the SMS via Google (no carrier registration), then
   // exchange the verified ID token for Slide tokens at /auth/firebase.
@@ -986,6 +1474,28 @@ export default function SlideWebApp() {
   };
 
   const logout = () => {
+    const accessToken = tokensRef.current?.accessToken ?? null;
+    // Resolve every locally-owned call surface while this bearer still belongs
+    // to the account. `keepalive` lets these finish if logout navigates/closes.
+    const activeCallId = activeCallRef.current?.callId;
+    const acceptingCallId = acceptingCallIdRef.current;
+    const ringingCallId = incomingRef.current?.callId;
+    if (activeCallId) bestEffortCallResolution(activeCallId, "leave", accessToken);
+    // An in-flight accept is intentionally not resolved here: until its keyed
+    // response returns, this tab cannot know whether a sibling installation won.
+    // Its accept catch/reconciliation leaves only after confirming ownership.
+    if (ringingCallId && ringingCallId !== activeCallId && ringingCallId !== acceptingCallId) {
+      bestEffortCallResolution(ringingCallId, "decline", accessToken);
+    }
+
+    // Detach the browser endpoint while the bearer token still belongs to this
+    // account, then invalidate it locally even if the network cleanup fails.
+    void disableWebPush((endpoint) =>
+      jsonFetch("/push/register", accessToken, {
+        method: "DELETE",
+        body: JSON.stringify({ pushToken: endpoint }),
+      }),
+    ).catch(() => undefined);
     const refreshToken = tokensRef.current?.refreshToken;
     if (refreshToken) {
       void jsonFetch("/auth/logout", null, {
@@ -997,9 +1507,17 @@ export default function SlideWebApp() {
     saveList("slide.web.recents", []);
     setContacts([]);
     setRecents([]);
-    applyTokens(null);
+    pushRegistrationEpochRef.current += 1;
+    pushRegistrationInFlight.current = null;
+    setPushRegistrationState("idle");
+    invalidateMediaOperation();
+    outgoingCallGenerationRef.current = null;
+    acceptingCallIdRef.current = null;
+    incomingRef.current = null;
     setIncoming(null);
+    stopRingtone();
     endCall(false);
+    applyTokens(null);
   };
 
   const enableNotifications = async () => {
@@ -1011,19 +1529,9 @@ export default function SlideWebApp() {
     const permission = await Notification.requestPermission();
     setNotificationState(permission);
     if (permission === "granted" && tokensRef.current) {
-      void enableWebPush((subscription) =>
-        authedFetch("/push/register", {
-          method: "POST",
-          body: JSON.stringify({
-            pushToken: subscription.endpoint,
-            kind: "webpush",
-            p256dh: subscription.p256dh,
-            auth: subscription.auth,
-            platform: "web",
-            appVersion: "web",
-          }),
-        }),
-      );
+      await registerWebPush();
+    } else {
+      setPushRegistrationState("idle");
     }
   };
 
@@ -1109,8 +1617,17 @@ export default function SlideWebApp() {
     peerName: string,
     direction: "incoming" | "outgoing",
     video: boolean,
+    operationGeneration: number,
     meta: { phone?: string | null; userId?: string | null } = {},
   ) => {
+    const callId = session.call.id;
+    const assertCurrent = () => {
+      if (!isCurrentMediaOperation(operationGeneration, callId)) {
+        throw new StaleCallOperationError();
+      }
+    };
+
+    assertCurrent();
     stopRingtone();
     setStatus("Connecting media");
     setPeerConnected(false);
@@ -1121,7 +1638,7 @@ export default function SlideWebApp() {
     callStartRef.current = Date.now();
     assertBrowserReachableSfu(session);
     setCurrentActiveCall({
-      callId: session.call.id,
+      callId,
       peerName,
       direction,
       video,
@@ -1131,13 +1648,16 @@ export default function SlideWebApp() {
 
     // Remote media accumulates here as the other participant publishes tracks.
     const remote = new MediaStream();
+    remoteStreamRef.current = remote;
     setRemoteStream(remote);
 
     const refreshRemote = () => {
+      if (!isCurrentMediaOperation(operationGeneration, callId)) return;
       setRemoteStream(new MediaStream(remote.getTracks()));
       setRemoteVideoReady(remote.getVideoTracks().some((track) => track.readyState === "live"));
     };
     const markConnected = () => {
+      if (!isCurrentMediaOperation(operationGeneration, callId)) return;
       setStatus("Connected");
       setPeerConnected(true);
       if (!everConnectedRef.current) {
@@ -1158,9 +1678,14 @@ export default function SlideWebApp() {
         videoEncoding: VideoPresets.h720.encoding,
       },
     });
+    assertCurrent();
     room.current = lkRoom;
 
     lkRoom.on(RoomEvent.TrackSubscribed, (track: RemoteTrack) => {
+      if (!isCurrentMediaOperation(operationGeneration, callId)) {
+        track.mediaStreamTrack.stop();
+        return;
+      }
       if (track.kind === Track.Kind.Video || track.kind === Track.Kind.Audio) {
         remote.addTrack(track.mediaStreamTrack);
         refreshRemote();
@@ -1168,49 +1693,78 @@ export default function SlideWebApp() {
       }
     });
     lkRoom.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack) => {
+      if (!isCurrentMediaOperation(operationGeneration, callId)) return;
       remote.removeTrack(track.mediaStreamTrack);
       refreshRemote();
     });
     // The far side hung up / the room emptied → tear our side down too.
     lkRoom.on(RoomEvent.ParticipantDisconnected, () => {
-      if (lkRoom.numParticipants <= 1) endCall(false);
+      if (lkRoom.numParticipants === 0) endCall(true, callId);
     });
     lkRoom.on(RoomEvent.Disconnected, () => {
-      if (room.current === lkRoom) endCall(false);
+      if (room.current === lkRoom) endCall(true, callId);
     });
 
+    let mediaVideoEnabled = video;
     try {
       // Connect, then publish camera/mic. TCP fallback (port 7881) is built in,
       // so this works even where UDP is blocked.
       await lkRoom.connect(session.sfuUrl, session.joinToken);
+      assertCurrent();
       await lkRoom.localParticipant.setMicrophoneEnabled(true);
-      await lkRoom.localParticipant.setCameraEnabled(video);
+      assertCurrent();
+      if (video) {
+        try {
+          await lkRoom.localParticipant.setCameraEnabled(true);
+        } catch {
+          // Camera denial/unavailability should not discard a working accepted
+          // audio call. Keep the mic and room, and make the UI authoritative.
+          assertCurrent();
+          mediaVideoEnabled = false;
+          setCameraOff(true);
+        }
+      }
+      assertCurrent();
+
+      // Mirror the locally published tracks into a stream for the self-preview.
+      const localTracks: MediaStreamTrack[] = [];
+      lkRoom.localParticipant.trackPublications.forEach((pub) => {
+        const track = pub.track?.mediaStreamTrack;
+        if (track) localTracks.push(track);
+      });
+      assertCurrent();
+      const local = new MediaStream(localTracks);
+      localStreamRef.current = local;
+      setLocalStream(local);
+
+      setCurrentActiveCall({
+        callId,
+        peerName,
+        direction,
+        video: mediaVideoEnabled,
+        phone: meta.phone ?? null,
+        userId: meta.userId ?? null,
+      });
     } catch (error) {
+      const stillCurrent = isCurrentMediaOperation(operationGeneration, callId);
       if (room.current === lkRoom) room.current = null;
+      lkRoom.localParticipant.trackPublications.forEach((publication) => {
+        publication.track?.mediaStreamTrack.stop();
+      });
+      remote.getTracks().forEach((track) => track.stop());
       lkRoom.disconnect();
-      setLocalStream(null);
-      setRemoteStream(null);
-      setRemoteVideoReady(false);
-      setCurrentActiveCall(null);
+      if (stillCurrent) {
+        localStreamRef.current = null;
+        remoteStreamRef.current = null;
+        setLocalStream(null);
+        setRemoteStream(null);
+        setRemoteVideoReady(false);
+        if (activeCallRef.current?.callId === callId) {
+          setCurrentActiveCall(null);
+        }
+      }
       throw error;
     }
-
-    // Mirror the locally published tracks into a stream for the self-preview.
-    const localTracks: MediaStreamTrack[] = [];
-    lkRoom.localParticipant.trackPublications.forEach((pub) => {
-      const t = pub.track?.mediaStreamTrack;
-      if (t) localTracks.push(t);
-    });
-    setLocalStream(new MediaStream(localTracks));
-
-    setCurrentActiveCall({
-      callId: session.call.id,
-      peerName,
-      direction,
-      video,
-      phone: meta.phone ?? null,
-      userId: meta.userId ?? null,
-    });
   };
 
   const startCall = async (
@@ -1219,6 +1773,15 @@ export default function SlideWebApp() {
     ringStyle = "call",
   ) => {
     if (!tokensRef.current || !contact.userId) return;
+    if (
+      outgoingCallGenerationRef.current !== null ||
+      acceptingCallIdRef.current !== null ||
+      activeCallRef.current !== null ||
+      incomingRef.current !== null
+    ) {
+      setStatus("Finish the current call first");
+      return;
+    }
     if (contact.userId === user?.id) {
       setCallError("You can't call your own number.");
       return;
@@ -1229,6 +1792,10 @@ export default function SlideWebApp() {
       phone: contact.phone,
       displayName: contact.displayName,
     });
+    let resolutionAccessToken = tokensRef.current.accessToken;
+    const operationGeneration = beginMediaOperation(null);
+    outgoingCallGenerationRef.current = operationGeneration;
+    let createdCallId: string | null = null;
     try {
       setStatus("Starting call");
       const session = await authedFetch<CallSession>("/calls", {
@@ -1240,36 +1807,179 @@ export default function SlideWebApp() {
           ringStyle,
         }),
       });
+      resolutionAccessToken = tokensRef.current?.accessToken ?? resolutionAccessToken;
+      createdCallId = session.call.id;
+      // A very fast answer can beat the create response back to this tab. For
+      // the caller, `call_accepted` is progress, not a sibling-device terminal.
+      if (terminalCallsRef.current.get(createdCallId)?.type === "call_accepted") {
+        terminalCallsRef.current.delete(createdCallId);
+      }
+      if (!bindMediaOperation(operationGeneration, createdCallId)) {
+        throw new StaleCallOperationError();
+      }
       await startMedia(
         session,
         contact.displayName || contact.phone,
         "outgoing",
         video,
+        operationGeneration,
         { phone: contact.phone, userId: contact.userId },
       );
     } catch (error) {
+      if (createdCallId) {
+        bestEffortCallResolution(createdCallId, "leave", resolutionAccessToken);
+      }
+      const operationStillCurrent =
+        mediaOperationRef.current.generation === operationGeneration;
+      if (!operationStillCurrent) {
+        return;
+      }
+      if (error instanceof StaleCallOperationError) {
+        invalidateMediaOperation(createdCallId ?? undefined);
+        setStatus("Ready");
+        return;
+      }
+      invalidateMediaOperation(createdCallId ?? undefined);
       const message =
         error instanceof ApiError
           ? humanizeCallError(error.message)
           : "Could not start the call.";
       setCallError(message);
       setStatus("Ready");
+    } finally {
+      if (outgoingCallGenerationRef.current === operationGeneration) {
+        outgoingCallGenerationRef.current = null;
+      }
     }
   };
 
+  const beginKnockCall = (session: KnockSession) => {
+    // The first physical tap creates the durable invitation so a suspended or
+    // closed recipient rings. The raw tap is only a live rhythm enhancement.
+    sendKnock(session.userId);
+    setKnockSession(null);
+    void startCall(
+      {
+        phone: session.identityName,
+        displayName: session.identityName,
+        userId: session.userId,
+        onSlide: true,
+      },
+      false,
+      "knock",
+    );
+  };
+
   const acceptIncoming = async () => {
-    if (!tokensRef.current || !incoming) return;
-    try {
-      const call = incoming;
+    const call = incomingRef.current;
+    if (
+      !tokensRef.current ||
+      !call ||
+      acceptingCallIdRef.current !== null ||
+      activeCallRef.current !== null ||
+      outgoingCallGenerationRef.current !== null
+    ) {
+      return;
+    }
+    if (isTerminalCall(call.callId) || invitationExpired(call)) {
+      rememberTerminalCall(call.callId);
+      incomingRef.current = null;
       setIncoming(null);
-      const session = await authedFetch<CallSession>(
-        `/calls/${call.callId}/accept`,
-        { method: "POST" },
+      stopRingtone();
+      void authedFetch(`/calls/${call.callId}/decline`, { method: "POST" }).catch(
+        () => undefined,
       );
-      await startMedia(session, call.fromName, "incoming", call.video, {
-        userId: call.fromUserId,
-      });
+      return;
+    }
+    acceptingCallIdRef.current = call.callId;
+    let resolutionAccessToken = tokensRef.current.accessToken;
+    const acceptKey = callAcceptKey(call.callId);
+    const operationGeneration = beginMediaOperation(call.callId);
+    let acceptedByThisInstallation = false;
+    try {
+      setIncoming(null);
+      incomingRef.current = null;
+      stopRingtone();
+      let session: CallSession;
+      try {
+        session = await authedFetch<CallSession>(`/calls/${call.callId}/accept`, {
+          method: "POST",
+          headers: { "X-Call-Accept-Key": acceptKey },
+        });
+      } catch (firstError) {
+        resolutionAccessToken = tokensRef.current?.accessToken ?? resolutionAccessToken;
+        if (
+          isAnsweredElsewhereError(firstError) ||
+          (firstError instanceof ApiError && firstError.status < 500)
+        ) {
+          throw firstError;
+        }
+        // The first response may have been lost after the server committed.
+        // Retry with the same key so the backend can return our session without
+        // allowing another installation to join.
+        await new Promise((resolve) => window.setTimeout(resolve, 350));
+        session = await authedFetch<CallSession>(`/calls/${call.callId}/accept`, {
+          method: "POST",
+          headers: { "X-Call-Accept-Key": acceptKey },
+        });
+      }
+      resolutionAccessToken = tokensRef.current?.accessToken ?? resolutionAccessToken;
+      acceptedByThisInstallation = true;
+      if (!bindMediaOperation(operationGeneration, call.callId)) {
+        throw new StaleCallOperationError();
+      }
+      const caller = session.call.participants?.find(
+        (participant) => participant.userId === session.call.createdBy,
+      );
+      const acceptedPeerName =
+        caller?.displayName || caller?.phone || call.fromName || "Someone";
+      const acceptedPeerUserId =
+        caller?.userId || (isActionableUserId(call.fromUserId) ? call.fromUserId : null);
+      await startMedia(
+        session,
+        acceptedPeerName,
+        "incoming",
+        call.video,
+        operationGeneration,
+        { userId: acceptedPeerUserId },
+      );
     } catch (error) {
+      if (isAnsweredElsewhereError(error)) {
+        rememberTerminalCall(call.callId, "call_accepted");
+        if (mediaOperationRef.current.generation === operationGeneration) {
+          invalidateMediaOperation(call.callId);
+        }
+        setStatus("Answered on another device");
+        stopRingtone();
+        return;
+      }
+      const currentOperation = mediaOperationRef.current;
+      const operationStillCurrent = currentOperation.generation === operationGeneration;
+      // A stale response must not tear down a newer owner of the same accepted
+      // call. Other stale paths (logout/terminal/new call) still resolve this
+      // abandoned participant using the bearer captured before auth changes.
+      const newerOperationOwnsCall =
+        !operationStillCurrent && currentOperation.callId === call.callId;
+      if (acceptedByThisInstallation && !newerOperationOwnsCall) {
+        bestEffortCallResolution(call.callId, "leave", resolutionAccessToken);
+      } else if (
+        !acceptedByThisInstallation &&
+        !(error instanceof ApiError && error.status < 500)
+      ) {
+        // We do not know whether a transport/5xx failure happened before or
+        // after commit. Reconcile with the same key; only a confirmed owner may
+        // send `/leave`, so a sibling installation's winning call stays intact.
+        void reconcileAmbiguousAccept(call.callId, acceptKey, resolutionAccessToken);
+      }
+      if (!operationStillCurrent) {
+        return;
+      }
+      if (error instanceof StaleCallOperationError) {
+        invalidateMediaOperation(call.callId);
+        setStatus("Ready");
+        return;
+      }
+      invalidateMediaOperation(call.callId);
       setCallError(
         error instanceof ApiError
           ? humanizeCallError(error.message)
@@ -1277,13 +1987,20 @@ export default function SlideWebApp() {
       );
       setStatus("Ready");
       stopRingtone();
+    } finally {
+      if (acceptingCallIdRef.current === call.callId) {
+        acceptingCallIdRef.current = null;
+      }
     }
   };
 
   const declineIncoming = async () => {
     if (!tokens || !incoming) return;
     const call = incoming;
+    rememberTerminalCall(call.callId);
+    invalidateMediaOperation(call.callId);
     setIncoming(null);
+    incomingRef.current = null;
     stopRingtone();
     recordRecent({
       id: `${call.callId}-${Date.now()}`,
@@ -1301,51 +2018,21 @@ export default function SlideWebApp() {
     }).catch(() => undefined);
   };
 
-  const endCall = (notifyServer = true) => {
-    stopRingtone();
-    const currentCall = activeCallRef.current;
-    // Null the ref first so the room's Disconnected handler doesn't re-enter.
-    const lkRoom = room.current;
-    room.current = null;
-    lkRoom?.disconnect();
-    localStream?.getTracks().forEach((track) => track.stop());
-    remoteStream?.getTracks().forEach((track) => track.stop());
-    if (currentCall) {
-      const connected = everConnectedRef.current;
-      const startedAt = callStartRef.current ?? Date.now();
-      recordRecent({
-        id: `${currentCall.callId}-${startedAt}`,
-        peerName: currentCall.peerName,
-        phone: currentCall.phone,
-        userId: currentCall.userId,
-        direction: currentCall.direction,
-        video: currentCall.video,
-        startedAt,
-        durationSec: connected ? Math.round((Date.now() - startedAt) / 1000) : 0,
-        connected,
-      });
-    }
-    if (notifyServer && tokensRef.current && currentCall) {
-      void authedFetch(`/calls/${currentCall.callId}/leave`, {
-        method: "POST",
-      }).catch(() => undefined);
-    }
-    callStartRef.current = null;
-    everConnectedRef.current = false;
-    setPeerConnected(false);
-    setRemoteVideoReady(false);
-    setLocalStream(null);
-    setRemoteStream(null);
-    setCurrentActiveCall(null);
-    setStatus("Ready");
-  };
-
   const notificationLabel = useMemo(() => {
-    if (notificationState === "granted") return "Notifications on";
+    if (notificationState === "granted" && pushRegistrationState === "registered") {
+      return "Notifications on";
+    }
+    if (notificationState === "granted" && pushRegistrationState === "registering") {
+      return "Enabling notifications…";
+    }
+    if (notificationState === "granted" && pushRegistrationState === "failed") {
+      return "Retry notifications";
+    }
+    if (notificationState === "granted") return "Enable notifications";
     if (notificationState === "denied") return "Notifications blocked";
     if (notificationState === "unsupported") return "Notifications unavailable";
     return "Enable notifications";
-  }, [notificationState]);
+  }, [notificationState, pushRegistrationState]);
 
   return (
     <section id="web" className="border-b border-hairline bg-bg">
@@ -1834,37 +2521,41 @@ export default function SlideWebApp() {
         <KnockSurface
           name={knockSession.name}
           theirPulse={knockTheirPulse}
-          onTap={() => sendKnock(knockSession.userId)}
-          onCall={() => {
-            const s = knockSession;
-            setKnockSession(null);
-            startCall(
-              { phone: s.name, displayName: s.name, userId: s.userId, onSlide: true },
-              false,
-              "knock",
-            );
-          }}
+          onTap={() => beginKnockCall(knockSession)}
+          onCall={() => beginKnockCall(knockSession)}
           onClose={() => setKnockSession(null)}
         />
       ) : null}
 
       {knocking && !knockSession ? (
         <KnockIncoming
-          name={knocking.fromName}
           pulseKey={knocking.pulse}
-          onKnockBack={() => {
-            const k = knocking;
-            openKnock(k.fromUserId, k.fromName);
-            sendKnock(k.fromUserId);
-          }}
-          onCall={() => {
-            const k = knocking;
-            setKnocking(null);
-            startCall(
-              { phone: k.fromName, displayName: k.fromName, userId: k.fromUserId, onSlide: true },
-              true,
-            );
-          }}
+          onKnockBack={
+            isActionableUserId(knocking.fromUserId)
+              ? () => {
+                  const k = knocking;
+                  openKnock(k.fromUserId, "Someone", k.fromName);
+                  sendKnock(k.fromUserId);
+                }
+              : undefined
+          }
+          onCall={
+            isActionableUserId(knocking.fromUserId)
+              ? () => {
+                  const k = knocking;
+                  setKnocking(null);
+                  startCall(
+                    {
+                      phone: k.fromName,
+                      displayName: k.fromName,
+                      userId: k.fromUserId,
+                      onSlide: true,
+                    },
+                    true,
+                  );
+                }
+              : undefined
+          }
           onDismiss={() => setKnocking(null)}
         />
       ) : null}
@@ -1873,12 +2564,14 @@ export default function SlideWebApp() {
         <div className="fixed inset-0 z-50 grid place-items-center bg-white/92 px-6 backdrop-blur-sm">
           <div className="w-full max-w-sm rounded-[8px] border border-hairline bg-white p-6 text-center shadow-[0_20px_80px_rgba(10,10,10,0.10)]">
             <div className="mx-auto flex h-24 w-24 animate-gentle-pulse items-center justify-center rounded-full border border-hairline text-[28px] font-light text-text">
-              {initials(incoming.fromName)}
+              {incoming.ringStyle === "knock" ? "✊" : initials(incoming.fromName)}
             </div>
-            <h2 className="mt-5 text-[30px] font-light text-text">{incoming.fromName}</h2>
+            <h2 className="mt-5 text-[30px] font-light text-text">
+              {incoming.ringStyle === "knock" ? "Knock knock." : incoming.fromName}
+            </h2>
             <p className="mt-1 text-[14px] text-text-secondary">
               {incoming.ringStyle === "knock"
-                ? "is knocking"
+                ? "Someone's at your door"
                 : incoming.video
                   ? "Incoming browser video call"
                   : "Incoming browser call"}

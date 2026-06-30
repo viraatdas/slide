@@ -1,12 +1,11 @@
 package ai.exla.slide.messaging
 
 import ai.exla.slide.data.repo.SlideRepository
+import ai.exla.slide.SlideApp
 import android.content.Context
 import android.util.Log
 import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 /**
@@ -32,14 +31,36 @@ object PushTokens {
             Log.i(TAG, "Firebase not configured; skipping FCM token registration")
             return
         }
-        val scope = CoroutineScope(Dispatchers.IO)
+        val app = context.applicationContext as? SlideApp ?: return
         runCatching {
             FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
-                val token = task.result
-                if (task.isSuccessful && !token.isNullOrBlank()) {
-                    scope.launch { repository.registerDevice(token) }
-                } else {
+                if (!task.isSuccessful) {
                     Log.w(TAG, "Failed to fetch FCM token", task.exception)
+                    return@addOnCompleteListener
+                }
+                val token = task.result
+                if (!token.isNullOrBlank()) {
+                    app.container.tokenStore.persistPendingPushToken(token)
+                    app.applicationScope.launch { repository.registerDevice(token) }
+                } else {
+                    Log.w(TAG, "Firebase returned an empty FCM token")
+                }
+            }
+        }.onFailure { Log.w(TAG, "FirebaseMessaging unavailable", it) }
+    }
+
+    /**
+     * Invalidate the installation token on logout. The server may still have
+     * the old value until its logout cleanup runs, but FCM can no longer route
+     * another account's calls to this signed-out installation. A fresh token is
+     * generated and registered after the next successful sign-in.
+     */
+    fun deleteCurrentToken(context: Context) {
+        if (!isFirebaseAvailable(context)) return
+        runCatching {
+            FirebaseMessaging.getInstance().deleteToken().addOnCompleteListener { task ->
+                if (!task.isSuccessful) {
+                    Log.w(TAG, "Failed to invalidate FCM token on logout", task.exception)
                 }
             }
         }.onFailure { Log.w(TAG, "FirebaseMessaging unavailable", it) }

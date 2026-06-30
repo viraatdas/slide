@@ -79,10 +79,22 @@ struct InCallView: View {
         .background(isVideoCall ? Theme.Color.text : Theme.Color.bg)
         .onAppear {
             KnockHaptics.shared.prepare()
+            vm.setMutedFromCallKit(call.systemMuted)
             vm.start()
             scheduleHide()
         }
-        .onDisappear { hideTask?.cancel() }
+        .onChange(of: call.systemMuted) { _, muted in
+            vm.setMutedFromCallKit(muted)
+        }
+        .onChange(of: call.isVideo) { _, enabled in
+            vm.setVideoEnabledFromCallState(enabled)
+        }
+        .onDisappear {
+            hideTask?.cancel()
+            // Remote-end and auth-reset paths dismiss this view without going
+            // through its red button. Always tear down LiveKit explicitly.
+            vm.end()
+        }
     }
 
     // MARK: Knock stage — keep tapping until they pick up.
@@ -467,7 +479,7 @@ struct InCallView: View {
                 Text("Couldn\u{2019}t connect")
                     .font(Theme.Font.title2)
                     .foregroundStyle(Theme.Color.text)
-                Text("Check your connection and try again.")
+                Text(call.endMessage ?? "Check your connection and try again.")
                     .font(Theme.Font.footnote)
                     .foregroundStyle(Theme.Color.textSecondary)
                 if !call.isGroup, call.remoteUserId?.isEmpty == false {

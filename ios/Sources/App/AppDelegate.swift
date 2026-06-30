@@ -49,17 +49,25 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // Hand the APNs token to Firebase for phone-auth verification. On a
         // TestFlight/App Store build the token is production; .unknown lets
         // Firebase auto-detect the environment.
-        Auth.auth().setAPNSToken(deviceToken, type: .unknown)
-        // Unblocks FirebaseAuthService.sendCode, which waits briefly for this
-        // so verification runs silently instead of via the reCAPTCHA page.
-        Task { @MainActor in FirebaseAuthService.apnsTokenReady = true }
+        if Config.useFirebaseAuth {
+            Auth.auth().setAPNSToken(deviceToken, type: .unknown)
+            // Unblocks FirebaseAuthService.sendCode, which waits briefly for this
+            // so verification runs silently instead of via the reCAPTCHA page.
+            Task { @MainActor in FirebaseAuthService.apnsTokenReady = true }
+        }
         #endif
         // Also register with our backend (kind "apns") so it can send alert
         // pushes: knock taps while backgrounded, missed knocks.
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
+        let previous = PushService.shared.standardTokenHex
         PushService.shared.standardTokenHex = hex
         if TokenStore.shared.isAuthenticated {
-            Task { try? await APIClient.shared.registerStandardPushToken(hex) }
+            Task {
+                if let previous, previous != hex {
+                    try? await APIClient.shared.unregisterPushToken(previous)
+                }
+                try? await APIClient.shared.registerStandardPushToken(hex)
+            }
         }
     }
 
@@ -77,20 +85,36 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                      didReceiveRemoteNotification notification: [AnyHashable: Any],
                      fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
         #if canImport(FirebaseAuth)
-        if Auth.auth().canHandleNotification(notification) {
+        if Config.useFirebaseAuth, Auth.auth().canHandleNotification(notification) {
             completionHandler(.noData)
             return
         }
         #endif
-        completionHandler(.newData)
+        if handleCallTerminal(notification) {
+            completionHandler(.newData)
+            return
+        }
+        completionHandler(.noData)
     }
 
     func application(_ app: UIApplication, open url: URL,
                      options _: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
         #if canImport(FirebaseAuth)
-        if Auth.auth().canHandle(url) { return true }
+        if Config.useFirebaseAuth, Auth.auth().canHandle(url) { return true }
         #endif
         return false
+    }
+
+    @discardableResult
+    private func handleCallTerminal(_ notification: [AnyHashable: Any]) -> Bool {
+        let type = notification["type"] as? String
+        let callId = notification["callId"] as? String
+        guard let type, let callId, !callId.isEmpty,
+              ["call_ended", "call_declined", "call_accepted"].contains(type) else {
+            return false
+        }
+        PushService.shared.receiveTerminalPush(type: type, callId: callId)
+        return true
     }
 }
 
@@ -98,6 +122,7 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        handleCallTerminal(notification.request.content.userInfo)
         completionHandler([])
     }
 }

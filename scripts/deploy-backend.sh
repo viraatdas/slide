@@ -20,6 +20,8 @@ cat <<'EOF'
     fly secrets set -a slide-api  DATABASE_URL="$SUPABASE_DB_URL" \
         REDIS_URL="$UPSTASH_REDIS_URL" JWT_SECRET="$JWT_SECRET" \
         SFU_JWT_SECRET="$SFU_JWT_SECRET" OTP_PEPPER="$OTP_PEPPER" \
+        LIVEKIT_URL="$LIVEKIT_URL" LIVEKIT_API_KEY="$LIVEKIT_API_KEY" \
+        LIVEKIT_API_SECRET="$LIVEKIT_API_SECRET" \
         SFU_PUBLIC_URL="wss://slide-sfu.fly.dev" \
         TURN_URIS="turn:slide-turn.fly.dev:3478?transport=udp" \
         TURN_SHARED_SECRET="$TURN_SHARED_SECRET" \

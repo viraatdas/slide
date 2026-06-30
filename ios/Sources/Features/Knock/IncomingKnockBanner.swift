@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// A lightweight incoming tap banner — NOT CallKit. Shows "<name> is tapping"
+/// A lightweight incoming tap banner — NOT CallKit. Shows "Someone is tapping"
 /// with "Tap back" and "Call" actions. Re-pulses on each received tap (driven
 /// by `knock.pulse`) and self-dismisses ~2.5s after the last tap (handled by
 /// AppState's auto-clear timer).
@@ -24,7 +24,10 @@ struct IncomingKnockBanner: View {
             .frame(width: 44, height: 44)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(knock.displayName)
+                // Live rhythm taps follow the same privacy rule as PushKit
+                // knock calls: identity stays internal until the recipient
+                // chooses the Call/answer path.
+                Text("Someone")
                     .font(Theme.Font.callout)
                     .foregroundStyle(Theme.Color.text)
                     .lineLimit(1)
@@ -35,39 +38,43 @@ struct IncomingKnockBanner: View {
 
             Spacer(minLength: Theme.Space.sm)
 
-            HStack(spacing: Theme.Space.xs) {
-                Button {
-                    guard let user = userForKnockStage else { return }
-                    appState.knockBack()
-                    appState.clearIncomingKnock()
-                    knockStageUser = user
-                } label: {
-                    Text("Tap back")
-                        .font(Theme.Font.buttonSmall)
-                        .foregroundStyle(Theme.Color.text)
-                        .padding(.horizontal, Theme.Space.sm)
-                        .frame(height: 36)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous)
-                                .stroke(Theme.Color.hairline, lineWidth: Theme.hairlineWidth)
-                        )
-                }
-                .buttonStyle(PressableButtonStyle())
+            if let actionableUser = userForKnockStage {
+                HStack(spacing: Theme.Space.xs) {
+                    Button {
+                        appState.knockBack()
+                        appState.clearIncomingKnock()
+                        knockStageUser = actionableUser
+                    } label: {
+                        Text("Tap back")
+                            .font(Theme.Font.buttonSmall)
+                            .foregroundStyle(Theme.Color.text)
+                            .padding(.horizontal, Theme.Space.sm)
+                            .frame(height: 36)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: Theme.Radius.small,
+                                                 style: .continuous)
+                                    .stroke(Theme.Color.hairline,
+                                            lineWidth: Theme.hairlineWidth)
+                            )
+                    }
+                    .buttonStyle(PressableButtonStyle())
 
-                Button {
-                    appState.callFromKnock(video: false)
-                } label: {
-                    Text("Call")
-                        .font(Theme.Font.buttonSmall)
-                        .foregroundStyle(Theme.Color.onAccent)
-                        .padding(.horizontal, Theme.Space.md)
-                        .frame(height: 36)
-                        .background(
-                            RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous)
-                                .fill(Theme.Color.accent)
-                        )
+                    Button {
+                        appState.callFromKnock(video: false)
+                    } label: {
+                        Text("Call")
+                            .font(Theme.Font.buttonSmall)
+                            .foregroundStyle(Theme.Color.onAccent)
+                            .padding(.horizontal, Theme.Space.md)
+                            .frame(height: 36)
+                            .background(
+                                RoundedRectangle(cornerRadius: Theme.Radius.small,
+                                                 style: .continuous)
+                                    .fill(Theme.Color.accent)
+                            )
+                    }
+                    .buttonStyle(PressableButtonStyle())
                 }
-                .buttonStyle(PressableButtonStyle())
             }
         }
         .padding(.horizontal, Theme.Space.md)
@@ -99,7 +106,7 @@ struct IncomingKnockBanner: View {
         guard let id = knock.fromUserId, !id.isEmpty else { return nil }
         return User(id: id,
                     phone: "",
-                    displayName: knock.displayName,
+                    displayName: "Someone",
                     avatarUrl: nil,
                     createdAt: nil,
                     lastSeenAt: nil)

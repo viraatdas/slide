@@ -81,3 +81,27 @@ export async function enableWebPush(
     return false;
   }
 }
+
+/**
+ * Detach this browser's existing subscription before signing out. The endpoint
+ * identifies an installation, so leaving it attached to the old account can
+ * route that person's future calls to the next person using this browser.
+ *
+ * Unsubscribe locally even when the API cleanup fails; the push service will
+ * then reject the dead endpoint and the backend can prune it on the next send.
+ */
+export async function disableWebPush(
+  unregisterSubscription: (endpoint: string) => Promise<unknown>,
+): Promise<void> {
+  if (!pushSupported()) return;
+
+  const registration = await navigator.serviceWorker.getRegistration();
+  const subscription = await registration?.pushManager.getSubscription();
+  if (!subscription) return;
+
+  try {
+    await unregisterSubscription(subscription.endpoint);
+  } finally {
+    await subscription.unsubscribe().catch(() => false);
+  }
+}

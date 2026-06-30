@@ -1,12 +1,8 @@
 package ai.exla.slide.messaging
 
 import ai.exla.slide.SlideApp
-import ai.exla.slide.call.telecom.SlideConnectionService
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 /**
@@ -19,7 +15,8 @@ import kotlinx.coroutines.launch
  * then it is dead code that simply compiles.
  *
  * Expected data payload (all string values, FCM data is always strings):
- *   type       -> "incoming_call" | "knock" | "call_ended" | "call_declined"
+ *   type       -> "incoming_call" | "knock" | "call_accepted" |
+ *                 "call_ended" | "call_declined"
  *   callId     -> call id (or knock correlation id)
  *   fromUserId -> caller's user id
  *   fromName   -> caller's display name
@@ -31,31 +28,50 @@ import kotlinx.coroutines.launch
  */
 class SlidePushService : FirebaseMessagingService() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
     override fun onNewToken(token: String) {
         super.onNewToken(token)
-        // Register the refreshed token with the backend (best-effort). Only
-        // attempts when signed in; the repo no-ops on a blank token.
-        val repo = (application as? SlideApp)?.container?.repository ?: return
-        scope.launch { repo.registerDevice(token) }
+        val app = application as? SlideApp ?: return
+        // Persist synchronously before Firebase may tear down this service.
+        // The process-wide scope attempts immediately; SlideApp startup and the
+        // foreground login path both retry the persisted handoff.
+        app.container.tokenStore.persistPendingPushToken(token)
+        app.applicationScope.launch { app.container.repository.registerDevice(token) }
     }
 
     override fun onMessageReceived(message: RemoteMessage) {
         super.onMessageReceived(message)
         val data = message.data
         val type = data["type"]?.takeIf { it.isNotBlank() } ?: return
+        val callId = data["callId"]?.takeIf { it.isNotBlank() } ?: return
+        val app = application as? SlideApp ?: return
+        if (!app.container.tokenStore.isLoggedIn) {
+            IncomingCallNotifier.dismiss(this, callId)
+            PushTokens.deleteCurrentToken(this)
+            return
+        }
+        if (type == "call_accepted") {
+            // Another installation accepted. On the accepting installation
+            // this is a harmless echo; on siblings it stops the ringer.
+            app.container.callEventCoordinator.resolve(
+                callId,
+                CallResolutionKind.AcceptedElsewhere,
+            )
+            return
+        }
         if (type == "call_ended" || type == "call_declined") {
-            IncomingCallNotifier.dismiss(this)
-            SlideConnectionService.endActiveConnectionFromRemote()
+            app.container.callEventCoordinator.resolve(
+                callId,
+                if (type == "call_ended") {
+                    CallResolutionKind.Ended
+                } else {
+                    CallResolutionKind.Declined
+                },
+            )
             return
         }
         if (type != "incoming_call" && type != "knock") return
 
-        val callId = data["callId"]?.takeIf { it.isNotBlank() } ?: return
-        IncomingCallNotifier.showIncoming(
-            context = this,
-            payload = IncomingCallPayload(
+        val payload = IncomingCallPayload(
                 type = type,
                 callId = callId,
                 fromUserId = data["fromUserId"].orEmpty(),
@@ -64,7 +80,10 @@ class SlidePushService : FirebaseMessagingService() {
                 videoEnabled = data["videoEnabled"]?.toBooleanStrictOrNull() ?: true,
                 ringStyle = data["ringStyle"]?.takeIf { it.isNotBlank() }
                     ?: if (data["knock"]?.toBooleanStrictOrNull() == true || type == "knock") "knock" else "call",
-            ),
-        )
+                sentAtMillis = message.sentTime.takeIf { it > 0L } ?: System.currentTimeMillis(),
+                expiresAtMillis = data["expiresAt"]?.toLongOrNull(),
+            )
+
+        app.container.callEventCoordinator.deliverIncoming(payload)
     }
 }

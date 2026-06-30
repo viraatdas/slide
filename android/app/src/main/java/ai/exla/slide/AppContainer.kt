@@ -7,6 +7,7 @@ import ai.exla.slide.data.api.ApiClient
 import ai.exla.slide.data.auth.TokenStore
 import ai.exla.slide.data.repo.SlideRepository
 import ai.exla.slide.signaling.SignalingClient
+import ai.exla.slide.messaging.CallEventCoordinator
 
 /**
  * Tiny manual DI container — avoids a heavyweight DI framework for a small
@@ -30,4 +31,14 @@ class AppContainer(context: Context) {
 
     /** Real media via LiveKit (self-hosted SFU). The mock remains for previews. */
     val callService: CallService by lazy { LiveKitCallService(appContext) }
+
+    val callEventCoordinator: CallEventCoordinator by lazy {
+        CallEventCoordinator(
+            app = appContext as SlideApp,
+            signaling = signalingClient,
+            repository = repository,
+            callService = callService,
+            tokenStore = tokenStore,
+        )
+    }
 }

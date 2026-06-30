@@ -116,6 +116,9 @@ data class RegisterDeviceBody(
     val appVersion: String,
 )
 
+@Serializable
+data class UnregisterPushBody(val pushToken: String)
+
 /* ---------------- Contacts ---------------- */
 
 @Serializable
@@ -181,6 +184,8 @@ data class SignalEnvelope(
     val videoEnabled: Boolean? = null,
     val ringStyle: String? = null,
     val knock: Boolean? = null,
+    /** Absolute server ring deadline (Unix epoch milliseconds). */
+    val expiresAt: Long? = null,
     val call: Call? = null,
     val from: JsonElement? = null,
     // Knock relay fields.

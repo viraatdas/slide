@@ -21,8 +21,8 @@ enum Config {
         #endif
     }
 
-    /// Whether to use the mocked CallService (real WebRTC requires a device to
-    /// verify). Defaults to `true` so screens render in the simulator.
+    /// Whether to use the mocked CallService (real LiveKit media requires a
+    /// device to verify). Defaults to `true` so screens render in the simulator.
     static var useMockCallService: Bool {
         if let raw = ProcessInfo.processInfo.environment["SLIDE_USE_REAL_WEBRTC"] {
             return !(raw == "1" || raw.lowercased() == "true")
@@ -31,7 +31,7 @@ enum Config {
         // Simulator can't do real capture; default to the mock for screens.
         return true
         #else
-        // Release/TestFlight on a real device: use real WebRTC so calls (and
+        // Release/TestFlight on a real device: use real media so calls (and
         // audio routing) actually work.
         return false
         #endif

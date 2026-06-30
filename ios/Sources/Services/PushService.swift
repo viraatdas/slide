@@ -27,11 +27,51 @@ final class PushService: NSObject, @unchecked Sendable {
     /// registered with the backend for alert pushes once signed in.
     var standardTokenHex: String?
 
+    private struct IncomingPayload {
+        let callId: String
+        let fromUserId: String?
+        let fromName: String?
+        let callType: CallType
+        let videoEnabled: Bool
+        let ringStyle: String
+        let expiresAt: Date?
+    }
+
+    private struct TerminalPayload {
+        let type: String
+        let callId: String
+    }
+
+    /// PushKit can wake the process before SwiftUI constructs AppState. Buffer
+    /// payloads until the handler exists so a cold-launch call is not reduced to
+    /// a CallKit screen with no app-side call to accept.
+    private var pendingIncoming: [IncomingPayload] = []
+    private var pendingTerminal: [TerminalPayload] = []
+    private var pendingReportFailures: [String] = []
+
     /// Invoked when a VoIP push arrives. AppState wires this up to surface the
-    /// call and join it on answer. Parameters mirror the push payload.
+    /// call and join it on answer. Parameters mirror the push payload. Setting
+    /// the handler replays anything received during cold launch.
     var onIncomingCall: ((_ callId: String, _ fromUserId: String?,
                           _ fromName: String?, _ callType: CallType,
-                          _ videoEnabled: Bool, _ ringStyle: String) -> Void)?
+                          _ videoEnabled: Bool, _ ringStyle: String,
+                          _ expiresAt: Date?) -> Void)? {
+        didSet { drainPendingEventsIfPossible() }
+    }
+
+    /// A rejected CXProvider report means there is no native surface the user
+    /// can answer. AppState must remove its mirrored call and resolve the server
+    /// invitation instead of leaving a silent/unanswerable screen.
+    var onIncomingCallReportFailed: ((_ callId: String) -> Void)? {
+        didSet { drainPendingEventsIfPossible() }
+    }
+
+    /// Standard background APNs carries terminal state because sending another
+    /// VoIP push just to cancel CallKit violates PushKit's call-only contract.
+    /// Buffer it across a cold launch exactly like the incoming VoIP payload.
+    var onCallTerminal: ((_ type: String, _ callId: String) -> Void)? {
+        didSet { drainPendingEventsIfPossible() }
+    }
 
     private override init() { super.init() }
 
@@ -39,6 +79,69 @@ final class PushService: NSObject, @unchecked Sendable {
     func start() {
         registry.delegate = self
         registry.desiredPushTypes = [.voIP]
+    }
+
+    private func deliver(_ payload: IncomingPayload) {
+        guard let onIncomingCall else {
+            // Replace a duplicate payload while preserving distinct calls; a
+            // WS + retry push should never create multiple pending screens.
+            pendingIncoming.removeAll { $0.callId == payload.callId }
+            pendingIncoming.append(payload)
+            return
+        }
+        onIncomingCall(payload.callId, payload.fromUserId, payload.fromName,
+                       payload.callType, payload.videoEnabled, payload.ringStyle,
+                       payload.expiresAt)
+    }
+
+    private func deliverReportFailure(callId: String) {
+        guard let onIncomingCallReportFailed else {
+            if !pendingReportFailures.contains(callId) {
+                pendingReportFailures.append(callId)
+            }
+            return
+        }
+        onIncomingCallReportFailed(callId)
+    }
+
+    func receiveTerminalPush(type: String, callId: String) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.receiveTerminalPush(type: type, callId: callId)
+            }
+            return
+        }
+        let payload = TerminalPayload(type: type, callId: callId)
+        guard let onCallTerminal else {
+            pendingTerminal.removeAll { $0.callId == callId }
+            pendingTerminal.append(payload)
+            return
+        }
+        onCallTerminal(type, callId)
+    }
+
+    private func drainPendingEventsIfPossible() {
+        if let onIncomingCall, !pendingIncoming.isEmpty {
+            let payloads = pendingIncoming
+            pendingIncoming.removeAll()
+            for payload in payloads {
+                onIncomingCall(payload.callId, payload.fromUserId, payload.fromName,
+                               payload.callType, payload.videoEnabled, payload.ringStyle,
+                               payload.expiresAt)
+            }
+        }
+        if let onIncomingCallReportFailed, !pendingReportFailures.isEmpty {
+            let failures = pendingReportFailures
+            pendingReportFailures.removeAll()
+            failures.forEach(onIncomingCallReportFailed)
+        }
+        if let onCallTerminal, !pendingTerminal.isEmpty {
+            let payloads = pendingTerminal
+            pendingTerminal.removeAll()
+            for payload in payloads {
+                onCallTerminal(payload.type, payload.callId)
+            }
+        }
     }
 }
 
@@ -50,16 +153,26 @@ extension PushService: PKPushRegistryDelegate {
                       for type: PKPushType) {
         guard type == .voIP else { return }
         let hex = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
+        let previous = voipToken
         voipToken = hex
         // Register with the backend if we're already signed in; otherwise the
         // post-sign-in hook in AppState will pick up `voipToken`.
-        Task { _ = try? await APIClient.shared.registerPushToken(hex) }
+        Task {
+            if let previous, previous != hex, TokenStore.shared.isAuthenticated {
+                try? await APIClient.shared.unregisterPushToken(previous)
+            }
+            _ = try? await APIClient.shared.registerPushToken(hex)
+        }
     }
 
     func pushRegistry(_ registry: PKPushRegistry,
                       didInvalidatePushTokenFor type: PKPushType) {
         guard type == .voIP else { return }
+        let invalidatedToken = voipToken
         voipToken = nil
+        if let invalidatedToken, TokenStore.shared.isAuthenticated {
+            Task { try? await APIClient.shared.unregisterPushToken(invalidatedToken) }
+        }
     }
 
     func pushRegistry(_ registry: PKPushRegistry,
@@ -73,7 +186,19 @@ extension PushService: PKPushRegistryDelegate {
         let eventType = (dict["type"] as? String) ?? "incoming_call"
         let isTapOnly = eventType == "knock" || ((dict["knock"] as? Bool) == true && callId.isEmpty)
         guard eventType == "incoming_call", !isTapOnly, !callId.isEmpty else {
-            completion()
+            // The backend contract sends only real incoming calls over VoIP.
+            // If that contract is ever violated, iOS still requires every VoIP
+            // delivery to be reported to CallKit. Report-and-end a failed
+            // placeholder instead of completing silently (which can cause the
+            // OS to terminate or throttle the app).
+            let fallbackUUID = callId.isEmpty ? UUID() : Self.uuid(for: callId)
+            CallKitManager.shared.reportIncomingCall(
+                uuid: fallbackUUID, handle: "Slide", displayName: "Slide",
+                hasVideo: false
+            ) { _ in
+                CallKitManager.shared.reportCallEnded(uuid: fallbackUUID, reason: .failed)
+                completion()
+            }
             return
         }
         let fromUserId = dict["fromUserId"] as? String
@@ -83,6 +208,7 @@ extension PushService: PKPushRegistryDelegate {
         let hasVideo = Self.boolValue(dict["videoEnabled"]) ?? true
         let ringStyle = (dict["ringStyle"] as? String)
             ?? ((Self.boolValue(dict["knock"]) ?? false) ? "knock" : "call")
+        let expiresAt = Self.epochMillisecondsDate(dict["expiresAt"])
         // Knocks ring anonymously — the whole point is "knock knock, who's
         // there?": you find out by answering. Normal calls show the name.
         let isKnock = ringStyle == "knock"
@@ -94,12 +220,29 @@ extension PushService: PKPushRegistryDelegate {
         // stable UUID derived from the callId so the in-app accept path can
         // match this CallKit call to the server-side call.
         let uuid = Self.uuid(for: callId)
+        let incoming = IncomingPayload(callId: callId, fromUserId: fromUserId,
+                                       fromName: fromName, callType: callType,
+                                       videoEnabled: hasVideo, ringStyle: ringStyle,
+                                       expiresAt: expiresAt)
+
+        let isExpired = expiresAt.map { $0 <= Date() } ?? false
+
         CallKitManager.shared.reportIncomingCall(
             uuid: uuid, handle: handle, displayName: displayName,
-            hasVideo: hasVideo) { _ in completion() }
+            hasVideo: hasVideo) { [weak self] error in
+                if error != nil, !isExpired {
+                    self?.deliverReportFailure(callId: callId)
+                } else if isExpired, error == nil {
+                    // Every VoIP push is still reported, but an invitation that
+                    // expired in transit must never surface as answerable.
+                    CallKitManager.shared.reportCallEnded(uuid: uuid, reason: .unanswered)
+                }
+                completion()
+            }
 
-        // Hand off to the app layer so answering actually joins the call.
-        onIncomingCall?(callId, fromUserId, fromName, callType, hasVideo, ringStyle)
+        // Hand off even when expired so AppState can tombstone the call without
+        // creating UI; this prevents a duplicate WS event from resurrecting it.
+        deliver(incoming)
     }
 
     /// Derive a stable UUID from the server call id so the CallKit call UUID is
@@ -143,5 +286,18 @@ extension PushService: PKPushRegistryDelegate {
         default:
             return nil
         }
+    }
+
+    private static func epochMillisecondsDate(_ value: Any?) -> Date? {
+        let milliseconds: Double?
+        switch value {
+        case let string as String: milliseconds = Double(string)
+        case let double as Double: milliseconds = double
+        case let int as Int: milliseconds = Double(int)
+        case let number as NSNumber: milliseconds = number.doubleValue
+        default: milliseconds = nil
+        }
+        guard let milliseconds, milliseconds.isFinite, milliseconds > 0 else { return nil }
+        return Date(timeIntervalSince1970: milliseconds / 1_000)
     }
 }

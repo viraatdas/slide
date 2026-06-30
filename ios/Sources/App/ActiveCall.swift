@@ -15,8 +15,8 @@ final class ActiveCall: ObservableObject, Identifiable {
     let direction: Direction
     @Published var remoteName: String
     let remotePhone: String
-    let remoteUserId: String?
-    let isVideo: Bool
+    @Published var remoteUserId: String?
+    @Published var isVideo: Bool
     let isKnock: Bool
 
     /// Whether this is a group call (more than one other participant).
@@ -28,6 +28,9 @@ final class ActiveCall: ObservableObject, Identifiable {
     @Published var status: Status
     @Published var callId: String?
     @Published var session: CallSession?
+    /// Mirrors mute changes initiated from the system CallKit UI. The in-call
+    /// view observes this and applies it to the media service.
+    @Published var systemMuted = false
 
     /// Increments for every knock tap received from the remote party while this
     /// call is on screen — the ringing UI observes it to thump per tap.
@@ -58,5 +61,13 @@ final class ActiveCall: ObservableObject, Identifiable {
         self.status = status
         self.isGroup = isGroup
         self.memberNames = memberNames.isEmpty ? [remoteName] : memberNames
+    }
+
+    /// Terminal call mutations are idempotent. Return the id on every cleanup
+    /// path so a later hangup/view teardown can retry after a transient failed
+    /// `/leave` instead of permanently orphaning the server-side call.
+    func callIdForBackendResolution() -> String? {
+        guard let callId, !callId.isEmpty else { return nil }
+        return callId
     }
 }

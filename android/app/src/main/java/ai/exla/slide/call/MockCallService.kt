@@ -26,6 +26,26 @@ class MockCallService : CallService {
     private val _state = MutableStateFlow(CallUiState())
     override val state: StateFlow<CallUiState> = _state.asStateFlow()
 
+    override fun prepare(
+        peer: CallPeer,
+        isIncoming: Boolean,
+        videoEnabled: Boolean,
+        ringStyle: String,
+        callId: String?,
+    ): Boolean {
+        ticker?.cancel()
+        _state.value = CallUiState(
+            callId = callId,
+            peer = peer,
+            connection = CallConnectionState.Connecting,
+            isIncoming = isIncoming,
+            ringStyle = ringStyle,
+            cameraEnabled = videoEnabled,
+            audioOnly = !videoEnabled,
+        )
+        return true
+    }
+
     override fun start(request: StartCallRequest) {
         ticker?.cancel()
         _state.value = CallUiState(
@@ -40,7 +60,12 @@ class MockCallService : CallService {
         )
         scope.launch {
             delay(1200)
-            _state.update { it.copy(connection = CallConnectionState.Connected) }
+            _state.update {
+                it.copy(
+                    connection = CallConnectionState.Connected,
+                    remoteParticipantPresent = true,
+                )
+            }
             ticker = scope.launch {
                 while (true) {
                     delay(1000)
@@ -52,7 +77,12 @@ class MockCallService : CallService {
 
     override fun end() {
         ticker?.cancel()
-        _state.value = CallUiState(connection = CallConnectionState.Ended)
+        _state.update { it.copy(connection = CallConnectionState.Ended) }
+    }
+
+    override fun fail() {
+        ticker?.cancel()
+        _state.update { it.copy(connection = CallConnectionState.Failed) }
     }
 
     override fun toggleMic(): Boolean {

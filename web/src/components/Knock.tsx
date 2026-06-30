@@ -155,16 +155,14 @@ export function KnockSurface({
 // Immersive incoming overlay: a centered card that flashes with each received
 // tap (in rhythm) and lets you knock back (→ enters the duet) or pick up.
 export function KnockIncoming({
-  name,
   pulseKey,
   onKnockBack,
   onCall,
   onDismiss,
 }: {
-  name: string;
   pulseKey: number;
-  onKnockBack: () => void;
-  onCall: () => void;
+  onKnockBack?: () => void;
+  onCall?: () => void;
   onDismiss: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -189,22 +187,26 @@ export function KnockIncoming({
         <p className="text-[11px] uppercase tracking-[0.22em] text-text-secondary">
           Knock knock knock
         </p>
-        <h2 className="mt-1 text-[24px] font-light text-text">{name}</h2>
-        <p className="mt-1 text-[13px] text-text-secondary">is knocking</p>
-        <div className="mt-6 grid grid-cols-2 gap-3">
-          <button
-            onClick={onKnockBack}
-            className="rounded-[10px] border border-hairline py-3 text-[14px] text-text transition-colors hover:border-text/30"
-          >
-            Knock back
-          </button>
-          <button
-            onClick={onCall}
-            className="rounded-[10px] bg-text py-3 text-[14px] text-white transition-transform active:scale-95"
-          >
-            Call
-          </button>
-        </div>
+        <h2 className="mt-1 text-[24px] font-light text-text">Someone&apos;s at the door</h2>
+        <p className="mt-1 text-[13px] text-text-secondary">
+          {onKnockBack && onCall ? "Answer to see who" : "An anonymous live rhythm"}
+        </p>
+        {onKnockBack && onCall ? (
+          <div className="mt-6 grid grid-cols-2 gap-3">
+            <button
+              onClick={onKnockBack}
+              className="rounded-[10px] border border-hairline py-3 text-[14px] text-text transition-colors hover:border-text/30"
+            >
+              Knock back
+            </button>
+            <button
+              onClick={onCall}
+              className="rounded-[10px] bg-text py-3 text-[14px] text-white transition-transform active:scale-95"
+            >
+              Call
+            </button>
+          </div>
+        ) : null}
         <button
           onClick={onDismiss}
           className="mt-3 text-[12px] text-text-secondary transition-colors hover:text-text"

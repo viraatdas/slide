@@ -19,6 +19,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
 import kotlin.math.pow
 
@@ -46,24 +47,34 @@ class SignalingClient(
     private val _connected = MutableSharedFlow<Boolean>(replay = 1, extraBufferCapacity = 4)
     val connected: SharedFlow<Boolean> = _connected.asSharedFlow()
 
-    private var webSocket: WebSocket? = null
+    @Volatile private var webSocket: WebSocket? = null
+    @Volatile private var pendingSocket: WebSocket? = null
     private var loopJob: Job? = null
     private var heartbeatJob: Job? = null
     private var attempt = 0
     @Volatile private var running = false
+    private val generation = AtomicLong(0)
 
+    @Synchronized
     fun connect() {
         if (running) return
         running = true
-        loopJob = scope.launch { connectLoop() }
+        attempt = 0
+        val currentGeneration = generation.incrementAndGet()
+        loopJob = scope.launch { connectLoop(currentGeneration) }
     }
 
+    @Synchronized
     fun disconnect() {
         running = false
+        generation.incrementAndGet()
         heartbeatJob?.cancel()
         loopJob?.cancel()
-        webSocket?.close(1000, "client disconnect")
+        pendingSocket?.cancel()
+        webSocket?.cancel()
+        pendingSocket = null
         webSocket = null
+        _connected.tryEmit(false)
     }
 
     fun send(envelope: SignalEnvelope): Boolean {
@@ -88,8 +99,8 @@ class SignalingClient(
             )
         )
 
-    private suspend fun connectLoop() {
-        while (running) {
+    private suspend fun connectLoop(currentGeneration: Long) {
+        while (isCurrent(currentGeneration)) {
             val token = tokenStore.accessToken
             if (token.isNullOrEmpty()) {
                 delay(2000)
@@ -97,8 +108,8 @@ class SignalingClient(
             }
             val url = "${wsBaseUrl.trimEnd('/')}?token=$token"
             val request = Request.Builder().url(url).build()
-            val opened = openSocket(request)
-            if (!running) break
+            val opened = openSocket(request, currentGeneration)
+            if (!isCurrent(currentGeneration)) break
             attempt = if (opened) 0 else attempt + 1
             val backoffMs = min(30_000.0, 500.0 * 2.0.pow(attempt.toDouble())).toLong()
             delay(backoffMs)
@@ -106,19 +117,26 @@ class SignalingClient(
     }
 
     /** Returns true once the socket successfully opened (so backoff can reset). */
-    private suspend fun openSocket(request: Request): Boolean {
+    private suspend fun openSocket(request: Request, currentGeneration: Long): Boolean {
         var everOpened = false
         val closed = CompletableDeferred<Unit>()
 
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (!isCurrent(currentGeneration)) {
+                    webSocket.cancel()
+                    if (!closed.isCompleted) closed.complete(Unit)
+                    return
+                }
                 everOpened = true
                 this@SignalingClient.webSocket = webSocket
+                if (pendingSocket === webSocket) pendingSocket = null
                 _connected.tryEmit(true)
-                startHeartbeat()
+                startHeartbeat(currentGeneration, webSocket)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (!isCurrent(currentGeneration) || this@SignalingClient.webSocket !== webSocket) return
                 runCatching { json.decodeFromString(SignalEnvelope.serializer(), text) }
                     .onSuccess { _events.tryEmit(it) }
             }
@@ -128,30 +146,56 @@ class SignalingClient(
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                _connected.tryEmit(false)
+                if (this@SignalingClient.webSocket === webSocket) {
+                    this@SignalingClient.webSocket = null
+                    heartbeatJob?.cancel()
+                    _connected.tryEmit(false)
+                }
                 if (!closed.isCompleted) closed.complete(Unit)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                _connected.tryEmit(false)
+                if (this@SignalingClient.webSocket === webSocket) {
+                    this@SignalingClient.webSocket = null
+                    heartbeatJob?.cancel()
+                    _connected.tryEmit(false)
+                }
                 if (!closed.isCompleted) closed.complete(Unit)
             }
         }
 
-        client.newWebSocket(request, listener)
-        closed.await()
-        heartbeatJob?.cancel()
-        webSocket = null
+        val socket = client.newWebSocket(request, listener)
+        pendingSocket = socket
+        if (!isCurrent(currentGeneration)) socket.cancel()
+        try {
+            closed.await()
+        } finally {
+            if (pendingSocket === socket) pendingSocket = null
+            if (!isCurrent(currentGeneration)) socket.cancel()
+            if (webSocket === socket) {
+                heartbeatJob?.cancel()
+                webSocket = null
+            }
+        }
         return everOpened
     }
 
-    private fun startHeartbeat() {
+    private fun startHeartbeat(currentGeneration: Long, socket: WebSocket) {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
-            while (running) {
+            while (isCurrent(currentGeneration) && webSocket === socket) {
                 delay(25_000)
-                send(SignalEnvelope(type = "heartbeat"))
+                if (isCurrent(currentGeneration) && webSocket === socket) {
+                    val payload = json.encodeToString(
+                        SignalEnvelope.serializer(),
+                        SignalEnvelope(type = "heartbeat"),
+                    )
+                    socket.send(payload)
+                }
             }
         }
     }
+
+    private fun isCurrent(currentGeneration: Long): Boolean =
+        running && generation.get() == currentGeneration && tokenStore.isLoggedIn
 }

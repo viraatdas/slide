@@ -1,5 +1,21 @@
 /* Slide web push service worker. Keep tiny, no deps. */
 
+function matchingClients() {
+  return self.clients.matchAll({ type: "window", includeUncontrolled: true });
+}
+
+function postToClients(message) {
+  return matchingClients().then((clients) => {
+    clients.forEach((client) => client.postMessage(message));
+  });
+}
+
+function closeCallNotifications(callId) {
+  return self.registration
+    .getNotifications({ tag: `slide-${callId}` })
+    .then((notifications) => notifications.forEach((notification) => notification.close()));
+}
+
 self.addEventListener("push", (event) => {
   let payload = {};
   try {
@@ -11,11 +27,21 @@ self.addEventListener("push", (event) => {
   const data = payload.data || payload;
   const type = data.type || payload.type;
   const callId = data.callId || payload.callId || "";
-  if ((type === "call_ended" || type === "call_declined") && callId) {
+  const expiresAt = data.expiresAt || payload.expiresAt;
+  if (
+    (type === "call_ended" || type === "call_declined" || type === "call_accepted") &&
+    callId
+  ) {
     event.waitUntil(
-      self.registration
-        .getNotifications({ tag: `slide-${callId}` })
-        .then((notifications) => notifications.forEach((notification) => notification.close())),
+      Promise.all([
+        closeCallNotifications(callId),
+        postToClients({
+          type: "slide-call-terminal",
+          eventType: type,
+          callId,
+          call: data,
+        }),
+      ]),
     );
     return;
   }
@@ -31,28 +57,53 @@ self.addEventListener("push", (event) => {
   const fromName = payload.title || data.fromName || payload.fromName || "Slide";
   const body =
     payload.body ||
-    (isKnock ? "is knocking" : "Incoming Slide call");
+    (isKnock ? "Someone's at your door" : "Incoming Knock Knock call");
 
-  const title = isKnock ? `${fromName} is knocking` : fromName;
+  // A knock stays anonymous until it is answered. Keep the caller in the
+  // notification data so the app can reveal them after acceptance, never in
+  // lock-screen copy.
+  const title = isKnock ? "Knock knock…" : fromName;
+
+  const notificationData = {
+    callId,
+    type,
+    ringStyle,
+    knock: isKnock,
+    fromUserId,
+    fromName,
+    videoEnabled,
+    expiresAt,
+  };
+  const parsedExpiresAt = Number(expiresAt);
+  if (isCallInvite && Number.isFinite(parsedExpiresAt) && parsedExpiresAt <= Date.now()) {
+    event.waitUntil(
+      Promise.all([
+        closeCallNotifications(callId),
+        postToClients({ type: "slide-stale-invitation", call: notificationData }),
+      ]),
+    );
+    return;
+  }
 
   event.waitUntil(
-    self.registration.showNotification(title, {
-      body,
-      icon: "/icon-512.png",
-      badge: "/icon-512.png",
-      tag: callId ? `slide-${callId}` : isKnock ? "slide-knock" : "slide-call",
-      renotify: true,
-      requireInteraction: isCallInvite,
-      data: {
-        callId,
-        type,
-        ringStyle,
-        knock: isKnock,
-        fromUserId,
-        fromName,
-        videoEnabled,
-      },
-    }),
+    Promise.all([
+      // The service worker is the sole owner of system notifications. Always
+      // show the durable surface, even beside a visible tab: a reloaded browser
+      // may not have a user-activated AudioContext, so its in-page ringtone can
+      // be blocked by autoplay policy.
+      self.registration.showNotification(title, {
+        body,
+        icon: "/icon-512.png",
+        badge: "/icon-512.png",
+        tag: callId ? `slide-${callId}` : isKnock ? "slide-knock" : "slide-call",
+        renotify: true,
+        requireInteraction: isCallInvite,
+        data: notificationData,
+      }),
+      isCallInvite
+        ? postToClients({ type: "slide-push-event", call: notificationData })
+        : Promise.resolve(),
+    ]),
   );
 });
 

@@ -12,8 +12,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
-    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <!-- Ring an incoming call full-screen over the lock screen, like a phone call. -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.VIBRATE" />
@@ -30,7 +28,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.Slide"
-        android:usesCleartextTraffic="true"
+        android:usesCleartextTraffic="${usesCleartextTraffic}"
         tools:targetApi="34">
 
         <activity
@@ -45,16 +43,6 @@
             </intent-filter>
         </activity>
 
-        <!-- Native call integration via Telecom ConnectionService. -->
-        <service
-            android:name=".call.telecom.SlideConnectionService"
-            android:exported="true"
-            android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">
-            <intent-filter>
-                <action android:name="android.telecom.ConnectionService" />
-            </intent-filter>
-        </service>
-
         <!-- FCM push: turns a high-priority data message into a full-screen
              incoming-call notification. No-op until google-services.json is
              added (FirebaseApp never initializes without it). -->
@@ -66,17 +54,13 @@
             </intent-filter>
         </service>
 
-        <!-- Full-screen incoming-call surface launched by the push notification.
-             showWhenLocked + turnScreenOn so it rings over the lock screen. -->
-        <activity
-            android:name=".messaging.IncomingCallActivity"
+        <!-- Keeps camera/microphone media alive when an accepted call is
+             backgrounded. Started only after runtime media permissions exist. -->
+        <service
+            android:name=".call.CallForegroundService"
             android:exported="false"
-            android:excludeFromRecents="true"
-            android:launchMode="singleTop"
-            android:showOnLockScreen="true"
-            android:taskAffinity=""
-            android:theme="@style/Theme.Slide"
-            tools:targetApi="27" />
+            android:foregroundServiceType="camera|microphone"
+            android:stopWithTask="false" />
 
         <!-- Accept / Decline buttons on the incoming-call notification. -->
         <receiver

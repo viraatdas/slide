@@ -1,6 +1,8 @@
 package ai.exla.slide.messaging
 
 import android.Manifest
+import android.app.AlarmManager
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -10,22 +12,49 @@ import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.os.Build
+import android.os.SystemClock
+import ai.exla.slide.MainActivity
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
 import androidx.core.content.ContextCompat
+import kotlin.math.min
+
+internal const val INCOMING_RING_WINDOW_MS = 45_000L
+
+/** Remaining server ring window, accounting for delayed push delivery. */
+internal fun remainingIncomingRingMs(
+    nowMillis: Long,
+    sentAtMillis: Long,
+    expiresAtMillis: Long? = null,
+): Long {
+    val transportRemaining = if (sentAtMillis <= 0L || sentAtMillis > nowMillis) {
+        INCOMING_RING_WINDOW_MS
+    } else {
+        val age = (nowMillis - sentAtMillis).coerceAtLeast(0L)
+        (INCOMING_RING_WINDOW_MS - age).coerceIn(0L, INCOMING_RING_WINDOW_MS)
+    }
+    val serverRemaining = expiresAtMillis
+        ?.takeIf { it > 0L }
+        ?.let { (it - nowMillis).coerceIn(0L, INCOMING_RING_WINDOW_MS) }
+        ?: INCOMING_RING_WINDOW_MS
+    return min(transportRemaining, serverRemaining)
+}
 
 /**
  * Builds + posts the full-screen-intent incoming-call notification. On API 31+
  * it uses [NotificationCompat.CallStyle] so the system renders a native
  * phone-call style ringing UI; on older releases it falls back to a high-
  * priority notification with a full-screen intent. Either way the full-screen
- * intent launches [IncomingCallActivity] which shows over the lock screen.
+ * intent launches the single-task [MainActivity] which shows the same call
+ * state machine over the lock screen.
  */
 object IncomingCallNotifier {
 
     const val CHANNEL_ID = "slide_incoming_calls"
-    const val NOTIFICATION_ID = 4711
+    private const val PREFS = "slide_incoming_call"
+    private const val KEY_ACTIVE_CALL_ID = "active_call_id"
+    private const val KEY_SHOWN_AT = "shown_at"
 
     const val ACTION_ACCEPT = "ai.exla.slide.action.ACCEPT_CALL"
     const val ACTION_DECLINE = "ai.exla.slide.action.DECLINE_CALL"
@@ -54,13 +83,57 @@ object IncomingCallNotifier {
         nm.createNotificationChannel(channel)
     }
 
-    fun showIncoming(context: Context, payload: IncomingCallPayload) {
+    /**
+     * Post (or refresh) the one supported incoming invitation. Returns false
+     * when another call is already ringing or notifications are unavailable;
+     * callers should reject that invitation so the remote side does not ring
+     * forever.
+     */
+    fun showIncoming(context: Context, payload: IncomingCallPayload): Boolean {
         ensureChannel(context)
+        if (!canPostNotifications(context)) return false
+
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        val existingId = prefs.getString(KEY_ACTIVE_CALL_ID, null)
+        val existingShownAt = prefs.getLong(KEY_SHOWN_AT, 0L)
+        val existingIsFresh = existingId != null &&
+            remainingIncomingRingMs(now, existingShownAt) > 0L
+        if (existingIsFresh && existingId != payload.callId) return false
+        if (existingId != null && existingId != payload.callId) {
+            NotificationManagerCompat.from(context).cancel(notificationId(existingId))
+            cancelTimeout(context, existingId)
+        }
+        val isNew = existingId != payload.callId
+        val payloadRemaining = remainingIncomingRingMs(
+            now,
+            payload.sentAtMillis,
+            payload.expiresAtMillis,
+        )
+        val existingRemaining = if (!isNew && existingShownAt > 0L) {
+            remainingIncomingRingMs(now, existingShownAt)
+        } else {
+            INCOMING_RING_WINDOW_MS
+        }
+        val remainingRingMs = min(payloadRemaining, existingRemaining)
+        if (remainingRingMs <= 0L) {
+            existingId?.let { dismiss(context, it) }
+            return false
+        }
+        val shownAt = now - (INCOMING_RING_WINDOW_MS - remainingRingMs)
+        prefs.edit()
+            .putString(KEY_ACTIVE_CALL_ID, payload.callId)
+            .putLong(KEY_SHOWN_AT, shownAt)
+            .apply()
 
         // Full-screen intent: rings over the lock screen like a phone call.
         val fullScreenIntent = payload.putInto(
-            Intent(context, IncomingCallActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            Intent(context, MainActivity::class.java).apply {
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                )
             }
         )
         val fullScreenPi = PendingIntent.getActivity(
@@ -70,12 +143,12 @@ object IncomingCallNotifier {
             pendingIntentFlags(mutable = false),
         )
 
-        val acceptPi = actionPendingIntent(context, ACTION_ACCEPT, payload)
-        val declinePi = actionPendingIntent(context, ACTION_DECLINE, payload)
+        val acceptPi = acceptPendingIntent(context, payload)
+        val declinePi = broadcastPendingIntent(context, ACTION_DECLINE, payload)
 
-        val callerLabel = if (payload.isKnock) "${payload.fromName} is knocking" else payload.fromName
+        val callerLabel = if (payload.isKnock) "Someone is knocking" else payload.fromName
         val subtitle = when {
-            payload.isKnock -> "is knocking"
+            payload.isKnock -> "Slide to find out who"
             payload.videoEnabled -> "Incoming video call"
             else -> "Incoming call"
         }
@@ -88,8 +161,11 @@ object IncomingCallNotifier {
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setOngoing(true)
             .setAutoCancel(false)
+            .setOnlyAlertOnce(!isNew)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setFullScreenIntent(fullScreenPi, true)
+            .setContentIntent(fullScreenPi)
+            .setTimeoutAfter(remainingRingMs)
+            .setFullScreenIntent(fullScreenPi, canUseFullScreenIntent(context))
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val caller = Person.Builder().setName(callerLabel).setImportant(true).build()
@@ -100,19 +176,77 @@ object IncomingCallNotifier {
             builder
                 .addAction(android.R.drawable.sym_call_outgoing, "Decline", declinePi)
                 .addAction(android.R.drawable.sym_call_incoming, "Accept", acceptPi)
-                .setContentIntent(fullScreenPi)
         }
 
-        if (canPostNotifications(context)) {
-            NotificationManagerCompat.from(context).notify(NOTIFICATION_ID, builder.build())
+        val notification = builder.build().apply {
+            // A call should keep ringing until answered, declined, ended, or
+            // the bounded timeout fires. Ordinary notification sounds play once.
+            flags = flags or Notification.FLAG_INSISTENT
         }
+        // Repeat the revocable permission check at the call site so a user
+        // toggling notifications while this payload is processed cannot race
+        // us into SecurityException (and so lint can prove this call is safe).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            dismiss(context, payload.callId)
+            return false
+        }
+        try {
+            NotificationManagerCompat.from(context)
+                .notify(notificationId(payload.callId), notification)
+        } catch (_: SecurityException) {
+            dismiss(context, payload.callId)
+            return false
+        }
+        scheduleTimeout(context, payload, remainingRingMs)
+        return true
     }
 
-    fun dismiss(context: Context) {
-        NotificationManagerCompat.from(context).cancel(NOTIFICATION_ID)
+    /** Cancel only [callId]; a late terminal event must not kill a newer call. */
+    fun dismiss(context: Context, callId: String? = null): Boolean {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val activeId = prefs.getString(KEY_ACTIVE_CALL_ID, null) ?: return false
+        if (callId != null && activeId != callId) return false
+        NotificationManagerCompat.from(context).cancel(notificationId(activeId))
+        cancelTimeout(context, activeId)
+        prefs.edit().remove(KEY_ACTIVE_CALL_ID).remove(KEY_SHOWN_AT).apply()
+        return true
     }
 
-    private fun actionPendingIntent(
+    fun activeCallId(context: Context): String? {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val id = prefs.getString(KEY_ACTIVE_CALL_ID, null) ?: return null
+        val shownAt = prefs.getLong(KEY_SHOWN_AT, 0L)
+        if (remainingIncomingRingMs(System.currentTimeMillis(), shownAt) > 0L) return id
+        dismiss(context, id)
+        return null
+    }
+
+    private fun acceptPendingIntent(
+        context: Context,
+        payload: IncomingCallPayload,
+    ): PendingIntent {
+        // Notification trampolines are blocked on Android 12+: the action must
+        // target the Activity directly, not a receiver that starts an Activity.
+        val intent = payload.putInto(Intent(context, MainActivity::class.java)).apply {
+            putExtra(MainActivity.EXTRA_AUTO_ACCEPT, true)
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            )
+        }
+        return PendingIntent.getActivity(
+            context,
+            (ACTION_ACCEPT + payload.callId).hashCode(),
+            intent,
+            pendingIntentFlags(mutable = false),
+        )
+    }
+
+    private fun broadcastPendingIntent(
         context: Context,
         action: String,
         payload: IncomingCallPayload,
@@ -128,6 +262,49 @@ object IncomingCallNotifier {
         )
     }
 
+    private fun scheduleTimeout(
+        context: Context,
+        payload: IncomingCallPayload,
+        delayMs: Long,
+    ) {
+        val alarm = context.getSystemService(AlarmManager::class.java) ?: return
+        alarm.setAndAllowWhileIdle(
+            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+            SystemClock.elapsedRealtime() + delayMs,
+            timeoutPendingIntent(context, payload),
+        )
+    }
+
+    private fun cancelTimeout(context: Context, callId: String) {
+        val alarm = context.getSystemService(AlarmManager::class.java) ?: return
+        val intent = Intent(context, CallActionReceiver::class.java)
+            .setAction(CallActionReceiver.ACTION_RING_TIMEOUT)
+        alarm.cancel(
+            PendingIntent.getBroadcast(
+                context,
+                (CallActionReceiver.ACTION_RING_TIMEOUT + callId).hashCode(),
+                intent,
+                pendingIntentFlags(mutable = false),
+            )
+        )
+    }
+
+    private fun timeoutPendingIntent(
+        context: Context,
+        payload: IncomingCallPayload,
+    ): PendingIntent {
+        val intent = payload.putInto(Intent(context, CallActionReceiver::class.java))
+            .setAction(CallActionReceiver.ACTION_RING_TIMEOUT)
+        return PendingIntent.getBroadcast(
+            context,
+            (CallActionReceiver.ACTION_RING_TIMEOUT + payload.callId).hashCode(),
+            intent,
+            pendingIntentFlags(mutable = false),
+        )
+    }
+
+    private fun notificationId(callId: String): Int = callId.hashCode() xor 0x51_1D_E
+
     private fun pendingIntentFlags(mutable: Boolean): Int {
         var flags = PendingIntent.FLAG_UPDATE_CURRENT
         flags = flags or if (mutable) {
@@ -139,10 +316,23 @@ object IncomingCallNotifier {
     }
 
     private fun canPostNotifications(context: Context): Boolean {
+        if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            if (manager?.getNotificationChannel(CHANNEL_ID)?.importance ==
+                NotificationManager.IMPORTANCE_NONE
+            ) return false
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
         return ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.POST_NOTIFICATIONS,
         ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun canUseFullScreenIntent(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return true
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return false
+        return manager.canUseFullScreenIntent()
     }
 }

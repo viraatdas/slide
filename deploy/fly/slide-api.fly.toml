@@ -22,8 +22,8 @@ primary_region = "iad"
   API_BIND = "0.0.0.0:8080"
   EXPOSE_DEV_OTP = "false"
   FIREBASE_PROJECT_ID = "slide-b4c50"
-  # SFU on a Hetzner VPS (public IP directly on the NIC) behind Caddy TLS via
-  # sslip.io. The SFU code is verified (real browsers, bidirectional video).
+  # LIVEKIT_URL/API_KEY/API_SECRET are Fly secrets for the maintained clients.
+  # This URL remains the legacy custom-SFU fallback for older builds.
   SFU_PUBLIC_URL = "wss://178-156-247-146.sslip.io"
   SMS_PROVIDER = "console"
   # coturn on the same box (TURN fallback). NOTE: same-box relay hairpins for

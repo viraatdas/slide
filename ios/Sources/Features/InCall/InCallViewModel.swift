@@ -23,6 +23,10 @@ final class InCallViewModel: ObservableObject {
     private var timer: Timer?
     private var startedAt: Date?
     private var delegateBox: Delegate?
+    private var sessionCancellable: AnyCancellable?
+    private var hasStarted = false
+    private var hasJoinedSession = false
+    private var hasEnded = false
 
     init(call: ActiveCall) {
         self.call = call
@@ -39,6 +43,14 @@ final class InCallViewModel: ObservableObject {
         let box = Delegate(owner: self)
         self.delegateBox = box
         self.service.delegate = box
+        // A create/accept request can legitimately take up to the API's 20s
+        // timeout. Observe the session instead of polling for only four seconds
+        // and silently never joining when a slow request eventually succeeds.
+        self.sessionCancellable = call.$session
+            .compactMap { $0 }
+            .sink { [weak self] session in
+                Task { @MainActor in self?.sessionBecameAvailable(session) }
+            }
     }
 
     /// Participants with display names filled in from the call's member list
@@ -75,28 +87,32 @@ final class InCallViewModel: ObservableObject {
     }
 
     func start() {
+        guard !hasStarted else { return }
+        hasStarted = true
         guard let call else { return }
-        // Wait for the control-plane session, then join.
         if let session = call.session {
-            join(session)
-        } else {
-            // Poll briefly for the session created asynchronously.
-            Task { @MainActor in
-                for _ in 0..<40 where call.session == nil {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                }
-                if let session = call.session { join(session) }
-            }
+            sessionBecameAvailable(session)
         }
     }
 
-    private func join(_ session: CallSession) {
+    private func sessionBecameAvailable(_ session: CallSession) {
+        guard hasStarted, !hasJoinedSession, !hasEnded else { return }
+        hasJoinedSession = true
         service.join(session: session, videoEnabled: isVideoEnabled)
     }
 
     func toggleMute() {
         isMuted.toggle()
         service.setMuted(isMuted)
+        if let uuid = call?.uuid {
+            CallKitManager.shared.setMuted(uuid: uuid, muted: isMuted)
+        }
+    }
+
+    func setMutedFromCallKit(_ muted: Bool) {
+        guard muted != isMuted else { return }
+        isMuted = muted
+        service.setMuted(muted)
     }
 
     func toggleVideo() {
@@ -104,23 +120,44 @@ final class InCallViewModel: ObservableObject {
         service.setVideoEnabled(isVideoEnabled)
     }
 
+    func setVideoEnabledFromCallState(_ enabled: Bool) {
+        guard enabled != isVideoEnabled else { return }
+        isVideoEnabled = enabled
+        service.setVideoEnabled(enabled)
+    }
+
     func flipCamera() { service.flipCamera() }
 
     func end() {
+        guard !hasEnded else { return }
+        hasEnded = true
         timer?.invalidate()
+        sessionCancellable?.cancel()
         service.leave()
     }
 
     fileprivate func handleStateChange(_ state: CallConnectionState) {
         connectionState = state
         switch state {
+        case .connected:
+            call?.status = .active
         case .failed:
             Haptics.error()
+            call?.status = .failed
+            if let uuid = call?.uuid {
+                CallKitManager.shared.reportCallEnded(uuid: uuid, reason: .failed)
+            }
+            resolveBackendIfNeeded()
         case .ended:
-            if remoteJoined { SoundEffects.ended() }
+            if remoteJoined, call?.status != .ended { SoundEffects.ended() }
         default:
             break
         }
+    }
+
+    private func resolveBackendIfNeeded() {
+        guard let callId = call?.callIdForBackendResolution() else { return }
+        Task { await APIClient.shared.leaveCallBestEffort(id: callId) }
     }
 
     fileprivate func remoteVideoAvailable() {
