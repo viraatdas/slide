@@ -10,8 +10,8 @@ Knock Knock is **open source**. Found a bug or have an idea?
 
 - **Get it:** "Knock Knock - Video Chat" on the iOS App Store (TestFlight for
   the latest builds).
-- **Clients:** native iOS (SwiftUI) + Android (Kotlin/Compose), CallKit /
-  ConnectionService, native WebRTC.
+- **Clients:** native iOS (SwiftUI) + Android (Kotlin/Compose), using CallKit
+  and Android call-style notifications for background ringing.
 - **Media:** WebRTC through a self-hosted LiveKit SFU + coturn (STUN/TURN).
 - **Backend:** Rust (axum + sqlx + tokio), Postgres, Redis.
 - **Scope today:** 1:1 + group video/audio calls, knock-style ringing.
@@ -39,9 +39,15 @@ migrations/     in crates/slide-api/migrations (embedded at build time)
 ```bash
 docker compose up -d              # Postgres, Redis, coturn
 cp .env.example .env              # (a dev .env is already present)
+livekit-server --dev --bind 0.0.0.0 # media, in another shell
 cargo run -p slide-api            # http://localhost:8080  (runs migrations)
-cargo run -p slide-sfu            # ws://localhost:9000     (in another shell)
+# cargo run -p slide-sfu          # legacy clients only
 ```
+
+The maintained clients use LiveKit; `slide-sfu` remains only as a legacy
+fallback. Install the local server with `brew install livekit` (or follow the
+official LiveKit install instructions). Production must set `LIVEKIT_URL`,
+`LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` to one matching deployment.
 
 Smoke-test the whole phone-auth + call flow (uses the dev OTP):
 
@@ -52,7 +58,11 @@ Smoke-test the whole phone-auth + call flow (uses the dev OTP):
 ## Test
 
 ```bash
-cargo test                        # slide-core unit tests (jwt, otp, phone, turn)
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cd android && ./gradlew testDebugUnitTest lintDebug assembleDebug
+cd ../web && npm run build
 ```
 
 ## Deploy
@@ -63,6 +73,6 @@ maintainer details live in `AGENTS.md`.
 
 ## Design
 
-Warm eggshell `#FAF6EF` backgrounds, espresso `#5A4632` actions, dark-brown
-`#2A211B` thin text, taupe `#8A7C6D` secondary, hairline `#E6DCCB`, terracotta
-`#D4694F` for end-call/destructive only. Same system on every surface.
+Pure-white backgrounds, near-black type/actions, gray secondary text, hairline
+dividers, and restrained red for destructive actions. The same quiet, precise
+system is used on every surface; the exact tokens live in `AGENTS.md`.

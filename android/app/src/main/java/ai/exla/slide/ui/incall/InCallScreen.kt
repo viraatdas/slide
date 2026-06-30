@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
@@ -27,6 +29,7 @@ import androidx.compose.material.icons.outlined.CallEnd
 import androidx.compose.material.icons.outlined.Cameraswitch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -43,6 +46,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import ai.exla.slide.call.CallConnectionState
 import ai.exla.slide.call.CallUiState
@@ -52,19 +56,25 @@ import io.livekit.android.room.track.VideoTrack
 import ai.exla.slide.ui.components.AvatarCircle
 import ai.exla.slide.ui.components.CircleIconButton
 import ai.exla.slide.ui.theme.SlideColors
+import ai.exla.slide.knock.KnockEffects
 import ai.exla.slide.util.formatDuration
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 @Composable
-fun InCallScreen(vm: InCallViewModel, onEnded: () -> Unit) {
+fun InCallScreen(
+    vm: InCallViewModel,
+    onKnockTap: (() -> Unit)? = null,
+    onMediaTerminated: () -> Unit,
+    onEnded: () -> Unit,
+) {
     val state by vm.state.collectAsStateWithLifecycle()
 
     LaunchedEffect(state.connection) {
         if (state.connection == CallConnectionState.Ended ||
             state.connection == CallConnectionState.Failed
         ) {
-            onEnded()
+            onMediaTerminated()
         }
     }
 
@@ -89,7 +99,14 @@ fun InCallScreen(vm: InCallViewModel, onEnded: () -> Unit) {
             },
     ) {
         if (!isVideoCall) {
-            AudioOnlyStage(state)
+            if (state.ringStyle == "knock" &&
+                !state.remoteParticipantPresent &&
+                onKnockTap != null
+            ) {
+                KnockWaitingStage(state, onKnockTap)
+            } else {
+                AudioOnlyStage(state)
+            }
         } else if (!onVideoSurface) {
             VideoConnectingStage(state)
             DraggableSelfView(room = vm.room(), track = vm.localTrack())
@@ -128,6 +145,42 @@ fun InCallScreen(vm: InCallViewModel, onEnded: () -> Unit) {
                 onEnd = { vm.end(onEnded) },
             )
         }
+    }
+}
+
+@Composable
+private fun KnockWaitingStage(state: CallUiState, onKnockTap: () -> Unit) {
+    val context = LocalContext.current
+    val effects = remember { KnockEffects(context) }
+    DisposableEffect(effects) { onDispose { effects.release() } }
+
+    Column(
+        modifier = Modifier.fillMaxSize().systemBarsPadding(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Spacer(Modifier.weight(1f))
+        Text(
+            state.peer?.displayName ?: state.peer?.phone ?: "Slide",
+            color = SlideColors.Ink,
+            fontWeight = FontWeight.Light,
+            fontSize = 28.sp,
+        )
+        Spacer(Modifier.height(28.dp))
+        Box(
+            modifier = Modifier
+                .size(176.dp)
+                .background(SlideColors.Ink, CircleShape)
+                .clickable {
+                    effects.play()
+                    onKnockTap()
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("✊", fontSize = 68.sp, color = SlideColors.Bg)
+        }
+        Spacer(Modifier.height(20.dp))
+        Text("Tap to keep knocking", color = SlideColors.InkSecondary, fontSize = 15.sp)
+        Spacer(Modifier.weight(1f))
     }
 }
 
@@ -322,6 +375,7 @@ private fun LiveKitVideoView(
 
 private fun statusText(state: CallUiState): String = when (state.connection) {
     CallConnectionState.Connecting -> if (state.ringStyle == "knock") "Knocking…" else "Connecting…"
+    CallConnectionState.Ringing -> if (state.ringStyle == "knock") "Knocking…" else "Ringing…"
     CallConnectionState.Connected -> formatDuration(state.durationSec)
     CallConnectionState.Ended -> "Call ended"
     CallConnectionState.Failed -> "Call failed"

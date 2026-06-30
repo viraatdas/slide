@@ -4,7 +4,7 @@ A phone-only video calling app. Kotlin + Jetpack Compose + Material3, MVVM with
 ViewModels + StateFlow, built against the API and design contracts in
 [`AGENTS.md`](../AGENTS.md).
 
-- `minSdk` 26, `targetSdk` / `compileSdk` 34
+- `minSdk` 26, `targetSdk` / `compileSdk` 35
 - Application id `app.slide` (debug builds use `app.slide.debug`)
 - Gradle (Kotlin DSL) with the version catalog in `gradle/libs.versions.toml`
 
@@ -43,7 +43,7 @@ export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools
 
 yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses
 sdkmanager --sdk_root="$ANDROID_HOME" \
-  "platform-tools" "platforms;android-34" "build-tools;34.0.0" \
+  "platform-tools" "platforms;android-35" "build-tools;35.0.0" \
   "emulator" "system-images;android-34;google_apis;arm64-v8a"
 ```
 
@@ -54,8 +54,8 @@ sdkmanager --sdk_root="$ANDROID_HOME" \
 | JDK | OpenJDK 17.0.19 (Homebrew `openjdk@17`) |
 | Android cmdline-tools | cask `android-commandlinetools` (build 14742923) |
 | platform-tools (adb) | 1.0.41 |
-| Android platform | android-34 |
-| build-tools | 34.0.0 |
+| Android platform | android-35 |
+| build-tools | 35.0.0 |
 | emulator | r35.x (arm64) |
 | system image | `system-images;android-34;google_apis;arm64-v8a` |
 | Gradle | 8.9 (via wrapper) |
@@ -85,6 +85,29 @@ cd android
 ./gradlew assembleDebug          # → app/build/outputs/apk/debug/app-debug.apk
 ```
 
+### Firebase is mandatory for release
+
+Debug builds intentionally remain usable without Firebase. Release builds do
+not: closed/backgrounded apps depend on high-priority FCM data messages for
+incoming calls. Register Android apps with package ids `app.slide` and
+`app.slide.debug` in the existing Firebase project (the latter lets local debug
+builds exercise push), download the combined `google-services.json`, and place
+it at:
+
+```text
+android/app/google-services.json
+```
+
+`assembleRelease` and `bundleRelease` fail loudly when the file is missing so a
+non-ringing build cannot be uploaded accidentally. The file contains public
+client configuration used in the shipped APK; never substitute the server-side
+FCM service-account key.
+
+Android's explicit **Force stop** action disables that package's FCM delivery
+until the user manually launches it again; the OS does not provide an app-side
+override. Ordinary backgrounding, screen-off, process death, and swiping the
+task away are covered by FCM plus the call-style notification.
+
 ### Run on an emulator
 
 ```bash
@@ -106,8 +129,9 @@ Defaults target the emulator → host bridge:
 - WS:   `ws://10.0.2.2:8080/v1/ws`
 
 `10.0.2.2` is the emulator's alias for the host machine's `localhost`. Change
-these fields (or add product flavors) for staging/production. Cleartext is
-enabled (`usesCleartextTraffic`) for local dev only — disable for release.
+these fields (or add product flavors) for staging. Cleartext is enabled by a
+debug-only manifest placeholder; release builds use the production HTTPS/WSS
+URLs and reject cleartext traffic.
 
 ---
 
@@ -118,7 +142,7 @@ Manual DI via a small `AppContainer` constructed in `SlideApp` (Application).
 
 ```
 app.slide
-├── SlideApp                Application; builds AppContainer, registers Telecom account
+├── SlideApp                Application; builds AppContainer + app-scoped call observer
 ├── AppContainer            Manual DI graph (lazy singletons)
 ├── MainActivity            Edge-to-edge Compose host + splash
 ├── data
@@ -134,9 +158,9 @@ app.slide
 ├── signaling/SignalingClient.kt   OkHttp WebSocket /v1/ws?token=, heartbeat + backoff
 ├── call
 │   ├── CallService.kt      Interface over the media engine
-│   ├── MockCallService.kt  DEFAULT — renders in-call UI without a device/SFU
-│   ├── WebRtcCallService.kt Real org.webrtc PeerConnection → sfuUrl + iceServers
-│   └── telecom/            Self-managed ConnectionService so calls ring natively
+│   ├── LiveKitCallService.kt Production LiveKit media engine
+│   ├── MockCallService.kt  Preview/test implementation without device media
+│   └── CallForegroundService  Keeps camera/mic alive while a call is backgrounded
 ├── ui
 │   ├── theme/              Color, Type, Shape, Theme — all AGENTS.md design tokens
 │   ├── components/         PrimaryButton, SecondaryButton, Hairline, AvatarCircle,
@@ -155,7 +179,7 @@ app.slide
 
 1. **Onboarding** — phone-only. Welcome → Phone (`POST /auth/request-otp`) →
    6-digit OTP with auto-advance/auto-submit + resend countdown
-   (`POST /auth/verify-otp`, tokens stored encrypted, `POST /devices`) → Name for
+   (`POST /auth/verify-otp`, tokens stored encrypted, push registration) → Name for
    new users (`PATCH /me`).
 2. **Calls (Recents)** — wordmark + new-call icon, list with initials circle,
    name, "Incoming · 12m" / "Missed" (subtle red), call-back icon; empty state
@@ -171,20 +195,16 @@ app.slide
 5. **Profile** — large avatar, name (tap to edit → `PATCH /me`), phone, settings
    list with hairline dividers, log out in subtle red (`POST /auth/logout`).
 
-### WebRTC + Telecom
+### LiveKit + incoming-call notifications
 
-- `WebRtcCallService` builds a `PeerConnectionFactory`, captures camera+mic,
-  configures the `iceServers` from `/calls`, connects to `sfuUrl` with the
-  room-scoped `joinToken`, and runs SDP offer/answer + ICE trickle. The media
-  pipeline (capture, encode, tracks, ICE) is fully wired; the SFU envelope is
-  documented in `../AGENTS.md`.
-- **The app defaults to `MockCallService`** (see `AppContainer.callService`) so
-  every screen renders without a device camera or a live SFU. Swap to
-  `WebRtcCallService(appContext)` for real media on a device. This is why media
-  could not be end-to-end verified in this headless environment.
-- `telecom/SlideConnectionService` is a self-managed `ConnectionService`
-  registered at startup so Slide calls ring through the OS Telecom framework;
-  `TelecomBridge` forwards system answer/reject/disconnect to the app layer.
+- `LiveKitCallService` is the production media engine. It connects with the
+  room-scoped `joinToken`, publishes camera/microphone tracks, and starts
+  `CallForegroundService` so accepted calls survive screen-off/backgrounding.
+- High-priority FCM data messages and background WebSocket events converge on
+  one call-style notification and the single-task `MainActivity`. This avoids
+  competing Telecom, notification, and secondary-Activity state machines.
+- `MockCallService` remains available for previews/tests but is not the runtime
+  default.
 
 ---
 
@@ -264,13 +284,13 @@ Requirements before these lanes work:
 
 ### Remaining checklist for a real submission
 
-- [ ] Replace the FCM push token placeholder in `AuthViewModel.verifyOtp` with a
-      real Firebase Cloud Messaging token (`POST /devices`).
+- [ ] Add `app/google-services.json`; release builds intentionally fail without
+      it. Tokens register with both `/push/register` (delivery) and `/devices`
+      (inventory).
 - [ ] Provide adaptive launcher icons at full density (the included vector
       adaptive icon works but a designed asset is recommended).
-- [ ] Disable `usesCleartextTraffic` and point base URLs at production HTTPS/WSS.
-- [ ] Flip `AppContainer.callService` to `WebRtcCallService` and validate
-      against the live SFU; render `SurfaceViewRenderer`s for local/remote tracks.
+- [ ] Validate `LiveKitCallService` against production TURN/LiveKit on physical
+      devices and restricted networks.
 - [ ] Add a privacy policy + data-safety declarations (camera, mic, contacts).
 ```
 

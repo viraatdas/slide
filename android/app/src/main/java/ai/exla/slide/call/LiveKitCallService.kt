@@ -9,6 +9,7 @@ import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.room.track.Track
 import io.livekit.android.room.track.VideoTrack
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -32,15 +33,60 @@ class LiveKitCallService(private val appContext: Context) : CallService {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var ticker: Job? = null
+    private var connectJob: Job? = null
+    private var roomEventsJob: Job? = null
 
     private val _state = MutableStateFlow(CallUiState())
     override val state: StateFlow<CallUiState> = _state.asStateFlow()
 
-    private val room: Room = LiveKit.create(appContext)
+    private var activeRoom: Room? = null
     private var localVideo: VideoTrack? = null
     private var remoteVideo: VideoTrack? = null
 
+    override fun prepare(
+        peer: CallPeer,
+        isIncoming: Boolean,
+        videoEnabled: Boolean,
+        ringStyle: String,
+        callId: String?,
+    ): Boolean {
+        releaseRoom()
+        _state.value = CallUiState(
+            callId = callId,
+            peer = peer,
+            connection = CallConnectionState.Connecting,
+            isIncoming = isIncoming,
+            ringStyle = ringStyle,
+            cameraEnabled = videoEnabled,
+            audioOnly = !videoEnabled,
+        )
+        val started = CallForegroundService.startConnecting(
+            appContext,
+            callId,
+            peer.displayName ?: peer.phone,
+            videoEnabled,
+        )
+        if (!started) {
+            _state.update { it.copy(connection = CallConnectionState.Failed) }
+        }
+        return started
+    }
+
     override fun start(request: StartCallRequest) {
+        releaseRoom()
+        if (!CallForegroundService.promote(
+                appContext,
+                request.session.call.id,
+                request.peer.displayName ?: request.peer.phone,
+                request.videoEnabled,
+            )
+        ) {
+            _state.update { it.copy(callId = request.session.call.id) }
+            fail()
+            return
+        }
+        val room = LiveKit.create(appContext)
+        activeRoom = room
         localVideo = null
         remoteVideo = null
         _state.value = CallUiState(
@@ -53,34 +99,99 @@ class LiveKitCallService(private val appContext: Context) : CallService {
             audioOnly = !request.videoEnabled,
             remoteVideoActive = false,
         )
-        // Observe room + media events (connection state + tracks).
-        scope.launch { room.events.collect { onRoomEvent(it) } }
+        // One collector per Room. The old implementation accumulated event
+        // collectors on a singleton Room, so a disconnect from an old call
+        // could end a newer one.
+        roomEventsJob = scope.launch {
+            room.events.collect { event ->
+                if (activeRoom === room) onRoomEvent(room, event)
+            }
+        }
 
-        scope.launch {
-            runCatching {
+        connectJob = scope.launch {
+            try {
                 room.connect(request.session.sfuUrl, request.session.joinToken)
+                if (activeRoom !== room) return@launch
                 room.localParticipant.setMicrophoneEnabled(true)
-                if (request.videoEnabled) {
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                failRoomStart(room)
+                return@launch
+            }
+
+            if (request.videoEnabled) {
+                try {
                     room.localParticipant.setCameraEnabled(true)
+                    if (activeRoom !== room) return@launch
                     localVideo = room.localParticipant
                         .getTrackPublication(Track.Source.CAMERA)?.track as? VideoTrack
-                } else {
-                    room.localParticipant.setCameraEnabled(false)
+                    _state.update { it.copy(cameraEnabled = true) }
+                } catch (cameraError: CancellationException) {
+                    throw cameraError
+                } catch (cameraError: Throwable) {
+                    // Camera can be unavailable/in use even with permission.
+                    // Preserve the viable microphone connection as audio-only.
+                    runCatching { room.localParticipant.setCameraEnabled(false) }
+                    localVideo = null
+                    _state.update {
+                        it.copy(
+                            cameraEnabled = false,
+                            audioOnly = true,
+                        )
+                    }
                 }
-            }.onFailure {
-                _state.value = CallUiState(connection = CallConnectionState.Failed)
+            } else {
+                runCatching { room.localParticipant.setCameraEnabled(false) }
             }
         }
     }
 
-    private fun onRoomEvent(event: RoomEvent) {
+    private fun failRoomStart(room: Room) {
+        if (activeRoom !== room) return
+        activeRoom = null
+        roomEventsJob?.cancel()
+        runCatching { room.disconnect() }
+        CallForegroundService.stop(appContext)
+        _state.update { it.copy(connection = CallConnectionState.Failed) }
+    }
+
+    private fun onRoomEvent(room: Room, event: RoomEvent) {
         when (event) {
-            is RoomEvent.Connected -> onConnected()
-            is RoomEvent.Disconnected ->
-                _state.value = CallUiState(connection = CallConnectionState.Ended)
+            is RoomEvent.Connected -> onConnected(room)
+            is RoomEvent.Disconnected -> {
+                activeRoom = null
+                ticker?.cancel()
+                CallForegroundService.stop(appContext)
+                _state.update {
+                    it.copy(
+                        connection = CallConnectionState.Ended,
+                        remoteVideoActive = false,
+                        remoteParticipantPresent = false,
+                    )
+                }
+            }
             is RoomEvent.Reconnecting ->
                 _state.update { it.copy(connection = CallConnectionState.Connecting) }
+            is RoomEvent.Reconnected -> onConnected(room)
+            is RoomEvent.ParticipantConnected -> onRemoteParticipantJoined(room)
+            is RoomEvent.ParticipantDisconnected -> {
+                if (room.remoteParticipants.isEmpty()) {
+                    ticker?.cancel()
+                    _state.update {
+                        it.copy(
+                            connection = CallConnectionState.Ringing,
+                            durationSec = 0,
+                            remoteParticipantPresent = false,
+                            remoteVideoActive = false,
+                        )
+                    }
+                }
+            }
             is RoomEvent.TrackSubscribed -> {
+                // Track events are a fallback in case the participant event was
+                // emitted before this collector started.
+                onRemoteParticipantJoined(room)
                 (event.track as? VideoTrack)?.let { track ->
                     remoteVideo = track
                     _state.update { it.copy(remoteVideoActive = true) }
@@ -96,11 +207,32 @@ class LiveKitCallService(private val appContext: Context) : CallService {
         }
     }
 
-    private fun onConnected() {
-        _state.update { it.copy(connection = CallConnectionState.Connected) }
+    private fun onConnected(room: Room) {
+        if (room.remoteParticipants.isNotEmpty()) {
+            onRemoteParticipantJoined(room)
+            return
+        }
+        ticker?.cancel()
+        _state.update {
+            it.copy(
+                connection = CallConnectionState.Ringing,
+                durationSec = 0,
+                remoteParticipantPresent = false,
+            )
+        }
+    }
+
+    private fun onRemoteParticipantJoined(room: Room) {
+        if (activeRoom !== room) return
+        _state.update {
+            it.copy(
+                connection = CallConnectionState.Connected,
+                remoteParticipantPresent = true,
+            )
+        }
         ticker?.cancel()
         ticker = scope.launch {
-            while (true) {
+            while (activeRoom === room) {
                 delay(1000)
                 _state.update { it.copy(durationSec = it.durationSec + 1) }
             }
@@ -110,6 +242,7 @@ class LiveKitCallService(private val appContext: Context) : CallService {
     /* ---------------- Controls ---------------- */
 
     override fun toggleMic(): Boolean {
+        val room = activeRoom ?: return _state.value.micEnabled
         val next = !_state.value.micEnabled
         scope.launch { runCatching { room.localParticipant.setMicrophoneEnabled(next) } }
         _state.update { it.copy(micEnabled = next) }
@@ -118,6 +251,7 @@ class LiveKitCallService(private val appContext: Context) : CallService {
 
     override fun toggleCamera(): Boolean {
         if (_state.value.audioOnly) return false
+        val room = activeRoom ?: return _state.value.cameraEnabled
         val next = !_state.value.cameraEnabled
         scope.launch { runCatching { room.localParticipant.setCameraEnabled(next) } }
         _state.update { it.copy(cameraEnabled = next) }
@@ -133,11 +267,42 @@ class LiveKitCallService(private val appContext: Context) : CallService {
 
     override fun localVideoTrack(): VideoTrack? = localVideo
     override fun remoteVideoTrack(): VideoTrack? = remoteVideo
-    override fun room(): Room = room
+    override fun room(): Room? = activeRoom
 
     override fun end() {
+        releaseRoom()
+        CallForegroundService.stop(appContext)
+        _state.update {
+            it.copy(
+                connection = CallConnectionState.Ended,
+                remoteVideoActive = false,
+                remoteParticipantPresent = false,
+            )
+        }
+    }
+
+    override fun fail() {
+        releaseRoom()
+        CallForegroundService.stop(appContext)
+        _state.update {
+            it.copy(
+                connection = CallConnectionState.Failed,
+                remoteVideoActive = false,
+                remoteParticipantPresent = false,
+            )
+        }
+    }
+
+    private fun releaseRoom() {
         ticker?.cancel()
-        runCatching { room.disconnect() }
-        _state.value = CallUiState(connection = CallConnectionState.Ended)
+        connectJob?.cancel()
+        roomEventsJob?.cancel()
+        connectJob = null
+        roomEventsJob = null
+        val room = activeRoom
+        activeRoom = null
+        localVideo = null
+        remoteVideo = null
+        if (room != null) runCatching { room.disconnect() }
     }
 }

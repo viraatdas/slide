@@ -147,6 +147,16 @@ actor APIClient {
         ])
     }
 
+    /// Remove a standard or VoIP token from the current account. This matters
+    /// on logout and account switching: APNs tokens identify the app install,
+    /// not the signed-in user, so leaving one attached to an old account can
+    /// ring the wrong person on this phone.
+    func unregisterPushToken(_ token: String) async throws {
+        _ = try await send(path: "/push/register", method: "DELETE", body: [
+            "pushToken": token
+        ], allowEmpty: true)
+    }
+
     // MARK: - Contacts
 
     func syncContacts(phones: [String], names: [String] = []) async throws -> [ContactSyncResult] {
@@ -180,7 +190,11 @@ actor APIClient {
     }
 
     func acceptCall(id: String) async throws -> CallSession {
-        let data = try await send(path: "/calls/\(id)/accept", method: "POST", allowEmpty: false)
+        let data = try await perform(
+            path: "/calls/\(id)/accept", method: "POST", bodyData: nil,
+            authenticated: true, allowEmpty: false,
+            additionalHeaders: ["X-Call-Accept-Key": InstallationIdentity.callAcceptKey]
+        )
         return try decode(CallSession.self, from: data)
     }
 
@@ -189,7 +203,29 @@ actor APIClient {
     }
 
     func leaveCall(id: String) async throws {
-        _ = try await send(path: "/calls/\(id)/leave", method: "POST", allowEmpty: true)
+        _ = try await perform(
+            path: "/calls/\(id)/leave", method: "POST", bodyData: nil,
+            authenticated: true, allowEmpty: true,
+            additionalHeaders: ["X-Call-Accept-Key": InstallationIdentity.callAcceptKey]
+        )
+    }
+
+    /// Lifecycle cleanup must survive the transient outage that often caused
+    /// the call to fail in the first place. `/leave` is idempotent, so retry a
+    /// few times and still allow later owners (CallKit/view teardown) to retry.
+    func leaveCallBestEffort(id: String) async {
+        for attempt in 0..<3 {
+            do {
+                try await leaveCall(id: id)
+                return
+            } catch let error as APIError {
+                guard attempt < 2, error.shouldRetryCallAccept else { return }
+                let delay = UInt64(500_000_000 * (attempt + 1))
+                try? await Task.sleep(nanoseconds: delay)
+            } catch {
+                return
+            }
+        }
     }
 
     func calls(cursor: String? = nil) async throws -> CallListResponse {
@@ -246,9 +282,11 @@ actor APIClient {
     private func perform(path: String, method: String, bodyData: Data?,
                          authenticated: Bool, allowEmpty: Bool,
                          contentType: String = "application/json",
-                         isRetry: Bool = false) async throws -> Data {
+                         isRetry: Bool = false,
+                         additionalHeaders: [String: String] = [:]) async throws -> Data {
         var req = try makeRawRequest(path: path, method: method, bodyData: bodyData,
-                                     authenticated: authenticated, contentType: contentType)
+                                     authenticated: authenticated, contentType: contentType,
+                                     additionalHeaders: additionalHeaders)
         let (data, response) = try await transport(req)
         guard let http = response as? HTTPURLResponse else { throw APIError.http(status: -1) }
 
@@ -256,10 +294,12 @@ actor APIClient {
             // Silent refresh, then retry once.
             try await performRefresh()
             req = try makeRawRequest(path: path, method: method, bodyData: bodyData,
-                                     authenticated: authenticated, contentType: contentType)
+                                     authenticated: authenticated, contentType: contentType,
+                                     additionalHeaders: additionalHeaders)
             return try await perform(path: path, method: method, bodyData: bodyData,
                                      authenticated: authenticated, allowEmpty: allowEmpty,
-                                     contentType: contentType, isRetry: true)
+                                     contentType: contentType, isRetry: true,
+                                     additionalHeaders: additionalHeaders)
         }
 
         guard (200..<300).contains(http.statusCode) else {
@@ -267,7 +307,8 @@ actor APIClient {
             if let env = try? decoder.decode(APIErrorEnvelope.self, from: data) {
                 throw APIError.server(code: env.error.code,
                                       message: env.error.message,
-                                      retryAfter: env.error.retryAfter)
+                                      retryAfter: env.error.retryAfter,
+                                      status: http.statusCode)
             }
             throw APIError.http(status: http.statusCode)
         }
@@ -315,11 +356,13 @@ actor APIClient {
                              body: [String: String]?, authenticated: Bool) throws -> URLRequest {
         let bodyData = try body.map { try JSONSerialization.data(withJSONObject: $0) }
         return try makeRawRequest(path: path, method: method, bodyData: bodyData,
-                                  authenticated: authenticated, contentType: "application/json")
+                                  authenticated: authenticated, contentType: "application/json",
+                                  additionalHeaders: [:])
     }
 
     private func makeRawRequest(path: String, method: String, bodyData: Data?,
-                                authenticated: Bool, contentType: String) throws -> URLRequest {
+                                authenticated: Bool, contentType: String,
+                                additionalHeaders: [String: String] = [:]) throws -> URLRequest {
         guard let url = URL(string: baseURL.absoluteString + path) else {
             throw APIError.invalidURL
         }
@@ -330,6 +373,9 @@ actor APIClient {
             req.setValue(contentType, forHTTPHeaderField: "Content-Type")
         }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
+        for (header, value) in additionalHeaders {
+            req.setValue(value, forHTTPHeaderField: header)
+        }
         if authenticated {
             guard let token = tokens.accessToken else { throw APIError.notAuthenticated }
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")

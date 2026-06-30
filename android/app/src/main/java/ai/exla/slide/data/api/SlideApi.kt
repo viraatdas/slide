@@ -15,11 +15,14 @@ import ai.exla.slide.data.model.RequestOtpBody
 import ai.exla.slide.data.model.RequestOtpResponse
 import ai.exla.slide.data.model.SyncContactsBody
 import ai.exla.slide.data.model.User
+import ai.exla.slide.data.model.UnregisterPushBody
 import ai.exla.slide.data.model.VerifyOtpBody
 import ai.exla.slide.data.model.VerifyOtpResponse
 import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.GET
+import retrofit2.http.HTTP
+import retrofit2.http.Header
 import retrofit2.http.PATCH
 import retrofit2.http.POST
 import retrofit2.http.Path
@@ -57,6 +60,17 @@ interface SlideApi {
     @POST("devices")
     suspend fun registerDevice(@Body body: RegisterDeviceBody): Device
 
+    /**
+     * Register a token with the delivery system. `/devices` is retained for
+     * device inventory, but incoming push fan-out reads `push_subscriptions`,
+     * which is populated by this endpoint.
+     */
+    @POST("push/register")
+    suspend fun registerPush(@Body body: RegisterDeviceBody): Response<Unit>
+
+    @HTTP(method = "DELETE", path = "push/register", hasBody = true)
+    suspend fun unregisterPush(@Body body: UnregisterPushBody): Response<Unit>
+
     /* ---- Contacts ---- */
 
     @POST("contacts/sync")
@@ -74,11 +88,17 @@ interface SlideApi {
     suspend fun createCall(@Body body: CreateCallBody): CallSession
 
     @POST("calls/{id}/accept")
-    suspend fun acceptCall(@Path("id") id: String): CallSession
+    suspend fun acceptCall(
+        @Path("id") id: String,
+        @Header("X-Call-Accept-Key") acceptKey: String,
+    ): CallSession
 
     @POST("calls/{id}/decline")
     suspend fun declineCall(@Path("id") id: String): Response<Unit>
 
     @POST("calls/{id}/leave")
-    suspend fun leaveCall(@Path("id") id: String): Response<Unit>
+    suspend fun leaveCall(
+        @Path("id") id: String,
+        @Header("X-Call-Accept-Key") acceptKey: String,
+    ): Response<Unit>
 }

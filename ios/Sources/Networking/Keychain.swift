@@ -88,3 +88,21 @@ final class TokenStore: @unchecked Sendable {
         keychain.remove(refreshKey)
     }
 }
+
+/// Stable for this installed app, independent of the signed-in account. The
+/// backend uses it to elect exactly one installation when two devices answer
+/// the same account's call at once, while allowing safe same-device retries.
+enum InstallationIdentity {
+    private static let callAcceptKeyName = "slide.callAcceptKey"
+
+    static let callAcceptKey: String = {
+        if let existing = UserDefaults.standard.string(forKey: callAcceptKeyName),
+           existing.count >= 8, existing.count <= 128,
+           existing.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }) {
+            return existing
+        }
+        let generated = UUID().uuidString.lowercased()
+        UserDefaults.standard.set(generated, forKey: callAcceptKeyName)
+        return generated
+    }()
+}

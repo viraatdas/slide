@@ -4,7 +4,8 @@ import Foundation
 
 enum SignalingEvent {
     case incomingCall(callId: String, fromUserId: String?, fromName: String?,
-                      type: CallType, videoEnabled: Bool, ringStyle: String)
+                      type: CallType, videoEnabled: Bool, ringStyle: String,
+                      expiresAt: Date?)
     case callAccepted(callId: String, byUserId: String?)
     case callDeclined(callId: String, byUserId: String?)
     case callEnded(callId: String)
@@ -35,7 +36,14 @@ final class SignalingClient: NSObject, @unchecked Sendable {
 
     private var isStarted = false
     private var reconnectAttempt = 0
-    private var heartbeatTimer: Timer?
+    private var heartbeatTimer: DispatchSourceTimer?
+    private var socketGeneration = 0
+    private var retryGeneration = 0
+    private struct PendingMessage {
+        let text: String
+        let expiresAt: Date
+    }
+    private var pendingKnocks: [PendingMessage] = []
     private let queue = DispatchQueue(label: "app.slide.signaling")
 
     init(baseURL: URL = Config.apiBaseURL, tokens: TokenStore = .shared) {
@@ -49,8 +57,26 @@ final class SignalingClient: NSObject, @unchecked Sendable {
 
     func connect() {
         queue.async { [weak self] in
-            guard let self, !self.isStarted else { return }
+            guard let self else { return }
             self.isStarted = true
+            guard self.task == nil else { return }
+            self.openSocket()
+        }
+    }
+
+    /// Cancel a stale/suspended socket and connect immediately. Foregrounding
+    /// calls this so `connect()` cannot be a no-op merely because an old task
+    /// still exists locally.
+    func reconnectNow() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.isStarted = true
+            self.retryGeneration += 1
+            self.reconnectAttempt = 0
+            self.stopHeartbeat()
+            let oldTask = self.task
+            self.task = nil
+            oldTask?.cancel(with: .goingAway, reason: nil)
             self.openSocket()
         }
     }
@@ -59,9 +85,11 @@ final class SignalingClient: NSObject, @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             self.isStarted = false
+            self.retryGeneration += 1
             self.stopHeartbeat()
-            self.task?.cancel(with: .goingAway, reason: nil)
+            let oldTask = self.task
             self.task = nil
+            oldTask?.cancel(with: .goingAway, reason: nil)
         }
     }
 
@@ -84,21 +112,25 @@ final class SignalingClient: NSObject, @unchecked Sendable {
     private func openSocket() {
         guard isStarted, let url = wsURL() else { return }
         let task = session.webSocketTask(with: url)
+        socketGeneration += 1
+        let generation = socketGeneration
         self.task = task
         task.resume()
-        receiveLoop()
-        startHeartbeat()
+        receiveLoop(task: task, generation: generation)
     }
 
-    private func receiveLoop() {
-        task?.receive { [weak self] result in
+    private func receiveLoop(task: URLSessionWebSocketTask, generation: Int) {
+        task.receive { [weak self] result in
             guard let self else { return }
-            switch result {
-            case .success(let message):
-                self.handle(message)
-                self.receiveLoop()
-            case .failure:
-                self.handleDisconnect()
+            self.queue.async {
+                guard self.task === task, self.socketGeneration == generation else { return }
+                switch result {
+                case .success(let message):
+                    self.handle(message)
+                    self.receiveLoop(task: task, generation: generation)
+                case .failure:
+                    self.handleDisconnect(task: task, generation: generation)
+                }
             }
         }
     }
@@ -141,11 +173,16 @@ final class SignalingClient: NSObject, @unchecked Sendable {
                     ?? (from?["displayName"] as? String) ?? (from?["phone"] as? String),
                 type: callType,
                 videoEnabled: videoEnabled,
-                ringStyle: ringStyle)
+                ringStyle: ringStyle,
+                expiresAt: epochMillisecondsDate(obj["expiresAt"] ?? call?["expiresAt"]))
         case "call_accepted":
-            return .callAccepted(callId: callIdOf(obj), byUserId: obj["byUserId"] as? String)
+            return .callAccepted(callId: callIdOf(obj),
+                                 byUserId: obj["byUserId"] as? String
+                                    ?? obj["userId"] as? String)
         case "call_declined":
-            return .callDeclined(callId: callIdOf(obj), byUserId: obj["byUserId"] as? String)
+            return .callDeclined(callId: callIdOf(obj),
+                                 byUserId: obj["byUserId"] as? String
+                                    ?? obj["userId"] as? String)
         case "call_ended":
             return .callEnded(callId: callIdOf(obj))
         case "participant_joined":
@@ -198,12 +235,51 @@ final class SignalingClient: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Incoming expiry is transported as epoch milliseconds; accept JSON
+    /// strings and numbers because APNs/WS serializers differ.
+    private static func epochMillisecondsDate(_ value: Any?) -> Date? {
+        let milliseconds: Double?
+        switch value {
+        case let string as String:
+            milliseconds = Double(string)
+        case let double as Double:
+            milliseconds = double
+        case let int as Int:
+            milliseconds = Double(int)
+        case let number as NSNumber:
+            milliseconds = number.doubleValue
+        default:
+            milliseconds = nil
+        }
+        guard let milliseconds, milliseconds.isFinite, milliseconds > 0 else { return nil }
+        return Date(timeIntervalSince1970: milliseconds / 1_000)
+    }
+
     // MARK: Outbound
 
     func send(_ object: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: object),
               let string = String(data: data, encoding: .utf8) else { return }
-        task?.send(.string(string)) { _ in }
+        let isKnock = object["type"] as? String == "knock"
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard let task = self.task else {
+                if isKnock { self.enqueueKnock(string) }
+                if self.isStarted {
+                    self.retryGeneration += 1
+                    self.openSocket()
+                }
+                return
+            }
+            let generation = self.socketGeneration
+            task.send(.string(string)) { [weak self, weak task] error in
+                guard error != nil, let self, let task else { return }
+                self.queue.async {
+                    if isKnock { self.enqueueKnock(string) }
+                    self.handleDisconnect(task: task, generation: generation)
+                }
+            }
+        }
     }
 
     func presencePing() { send(["type": "presence_ping"]) }
@@ -216,38 +292,55 @@ final class SignalingClient: NSObject, @unchecked Sendable {
     }
     private func heartbeat() { send(["type": "heartbeat"]) }
 
-    private func startHeartbeat() {
-        DispatchQueue.main.async { [weak self] in
-            self?.heartbeatTimer?.invalidate()
-            self?.heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 25, repeats: true) { _ in
-                self?.queue.async { self?.heartbeat() }
-            }
+    private func enqueueKnock(_ text: String) {
+        pendingKnocks.removeAll { $0.expiresAt <= Date() }
+        pendingKnocks.append(PendingMessage(text: text, expiresAt: Date().addingTimeInterval(5)))
+        if pendingKnocks.count > 20 { pendingKnocks.removeFirst(pendingKnocks.count - 20) }
+    }
+
+    private func flushPendingKnocks(on task: URLSessionWebSocketTask) {
+        let now = Date()
+        let messages = pendingKnocks.filter { $0.expiresAt > now }
+        pendingKnocks.removeAll()
+        for message in messages {
+            task.send(.string(message.text)) { _ in }
         }
     }
 
+    private func startHeartbeat() {
+        stopHeartbeat()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 25, repeating: 25)
+        timer.setEventHandler { [weak self] in self?.heartbeat() }
+        heartbeatTimer = timer
+        timer.resume()
+    }
+
     private func stopHeartbeat() {
-        DispatchQueue.main.async { [weak self] in
-            self?.heartbeatTimer?.invalidate()
-            self?.heartbeatTimer = nil
-        }
+        heartbeatTimer?.cancel()
+        heartbeatTimer = nil
     }
 
     // MARK: Reconnect with exponential backoff
 
-    private func handleDisconnect() {
-        queue.async { [weak self] in
+    private func handleDisconnect(task closedTask: URLSessionWebSocketTask,
+                                  generation: Int) {
+        guard task === closedTask, socketGeneration == generation else { return }
+        task = nil
+        stopHeartbeat()
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.stopHeartbeat()
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.delegate?.signalingDidDisconnect(self)
-            }
-            guard self.isStarted else { return }
-            self.reconnectAttempt += 1
-            let delay = min(pow(2.0, Double(self.reconnectAttempt)), 30.0)
-            self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
-                self?.openSocket()
-            }
+            self.delegate?.signalingDidDisconnect(self)
+        }
+        guard isStarted else { return }
+        reconnectAttempt += 1
+        let delay = min(pow(2.0, Double(reconnectAttempt)), 30.0)
+        retryGeneration += 1
+        let retry = retryGeneration
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.isStarted, self.task == nil,
+                  self.retryGeneration == retry else { return }
+            self.openSocket()
         }
     }
 }
@@ -255,16 +348,24 @@ final class SignalingClient: NSObject, @unchecked Sendable {
 extension SignalingClient: URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) {
-        reconnectAttempt = 0
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.delegate?.signalingDidConnect(self)
+        queue.async { [weak self] in
+            guard let self, self.task === webSocketTask else { return }
+            self.reconnectAttempt = 0
+            self.flushPendingKnocks(on: webSocketTask)
+            self.startHeartbeat()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.delegate?.signalingDidConnect(self)
+            }
         }
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
                     reason: Data?) {
-        handleDisconnect()
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.handleDisconnect(task: webSocketTask, generation: self.socketGeneration)
+        }
     }
 }

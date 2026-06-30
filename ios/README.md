@@ -19,7 +19,7 @@ xcodebuild -scheme Slide -sdk iphonesimulator \
 # or open Slide.xcodeproj in Xcode and ⌘R
 ```
 Verified: **BUILD SUCCEEDED**; the app launches in the Simulator (see
-`screenshots/`). The `stasel/WebRTC` package resolves and links.
+`screenshots/`). The LiveKit package resolves and links.
 
 ## Architecture
 - **App/** — `SlideApp` (@main), `RootView`, `MainTabView`, `AppState`, `ActiveCall`.
@@ -29,14 +29,26 @@ Verified: **BUILD SUCCEEDED**; the app launches in the Simulator (see
 - **Networking/** — `Config` (base URL), `Keychain`/`TokenStore`, `APIClient`
   (actor; every endpoint; 401 → silent refresh), `APIError`, `MockData`.
 - **Services/** — `SignalingClient` (app WS + reconnect/backoff),
-  `CallService` protocol + `MockCallService` (default) + `RealCallService`
-  (`#if canImport(WebRTC)` real RTCPeerConnection → SFU), `CallKitManager`.
+  `CallService` protocol + simulator `MockCallService` + production
+  `RealCallService` (LiveKit SFU), `PushService`, and `CallKitManager`.
 - **Features/** — Onboarding (Welcome/Phone/Code/Name), Calls (Recents),
   Contacts (+ sheet), InCall (+ incoming), Profile.
 
+### Incoming-call lifecycle
+
+- Real invitations arrive over both signaling WebSocket and PushKit and are
+  deduplicated by server `callId`; a live socket never suppresses VoIP push.
+- PushKit payloads are reported to CallKit before completion, buffered across a
+  cold launch, and bounded by the server-provided `expiresAt` deadline.
+- Standard APNs and VoIP tokens register separately through `/push/register`
+  and are detached on logout or token rotation.
+- CallKit answer/end/mute actions, media startup, and backend accept/leave are
+  one idempotent state machine, including sibling-device acceptance.
+
 Config: point `Config.baseURL` at the deployed API
-(`https://<api-host>/v1`). WebRTC + CallKit default to the mock in-Simulator;
-flip to the real path on a device (`SLIDE_USE_REAL_WEBRTC=1`).
+(`https://<api-host>/v1`). Media defaults to the mock in Debug/Simulator and to
+LiveKit in Release; `SLIDE_USE_REAL_WEBRTC=1` keeps the legacy override name for
+running real media from a debug build.
 
 ## Bundle id
 `app.exla.slide` (in `project.yml`). Must match the App ID registered in App Store

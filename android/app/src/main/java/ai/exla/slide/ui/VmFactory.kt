@@ -27,7 +27,11 @@ class VmFactory(private val container: AppContainer) : ViewModelProvider.Factory
         modelClass.isAssignableFrom(ProfileViewModel::class.java) ->
             ProfileViewModel(container.repository, container.tokenStore) as T
         modelClass.isAssignableFrom(InCallViewModel::class.java) ->
-            InCallViewModel(container.repository, container.callService) as T
+            InCallViewModel(
+                container.repository,
+                container.callService,
+                container.callEventCoordinator,
+            ) as T
         modelClass.isAssignableFrom(KnockViewModel::class.java) ->
             KnockViewModel(container.signalingClient, container.tokenStore) as T
         else -> throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")

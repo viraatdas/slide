@@ -21,8 +21,16 @@ struct SlideApp: App {
                 .preferredColorScheme(.light) // design is white-first, no dark mode
                 .task { await appState.bootstrap() }
                 .onChange(of: scenePhase) { _, phase in
-                    guard phase == .active else { return }
-                    Task { await appState.appBecameActive() }
+                    switch phase {
+                    case .active:
+                        Task { await appState.appBecameActive() }
+                    case .background:
+                        appState.appEnteredBackground()
+                    case .inactive:
+                        break
+                    @unknown default:
+                        break
+                    }
                 }
         }
     }

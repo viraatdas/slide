@@ -41,14 +41,15 @@ import ai.exla.slide.ui.theme.SlideColors
 /**
  * Lightweight incoming-knock overlay (NOT the full incoming-call screen). Sits
  * at the top of the screen above everything else, plays sound + haptic on each
- * tap, visibly pulses per incoming tap, and offers "Knock back" / "Call". It
- * auto-dismisses ~2.5s after the last tap (handled by [KnockViewModel]).
+ * tap and visibly pulses per incoming tap. Identified legacy knocks can offer
+ * actions; anonymous privacy-preserving taps remain display-only. It auto-
+ * dismisses ~2.5s after the last tap (handled by [KnockViewModel]).
  */
 @Composable
 fun IncomingKnockBanner(
     knock: IncomingKnock?,
-    onKnockBack: () -> Unit,
-    onCall: () -> Unit,
+    onKnockBack: (() -> Unit)?,
+    onCall: (() -> Unit)?,
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -99,7 +100,11 @@ fun IncomingKnockBanner(
                             color = SlideColors.Ink,
                         )
                         Text(
-                            text = "Knock back or pick up",
+                            text = if (onKnockBack != null || onCall != null) {
+                                "Knock back or pick up"
+                            } else {
+                                "Listen for the rhythm"
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = SlideColors.InkSecondary,
                         )
@@ -113,21 +118,29 @@ fun IncomingKnockBanner(
                             .padding(4.dp),
                     )
                 }
-                Spacer(Modifier.height(14.dp))
-                Row {
-                    BannerAction(
-                        label = "Knock back",
-                        filled = false,
-                        onClick = onKnockBack,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Spacer(Modifier.width(10.dp))
-                    BannerAction(
-                        label = "Call",
-                        filled = true,
-                        onClick = onCall,
-                        modifier = Modifier.weight(1f),
-                    )
+                if (onKnockBack != null || onCall != null) {
+                    Spacer(Modifier.height(14.dp))
+                    Row {
+                        if (onKnockBack != null) {
+                            BannerAction(
+                                label = "Knock back",
+                                filled = false,
+                                onClick = onKnockBack,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                        if (onKnockBack != null && onCall != null) {
+                            Spacer(Modifier.width(10.dp))
+                        }
+                        if (onCall != null) {
+                            BannerAction(
+                                label = "Call",
+                                filled = true,
+                                onClick = onCall,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
                 }
             }
         }

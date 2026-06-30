@@ -23,10 +23,16 @@ data class IncomingKnock(
     val fromName: String?,
     val pulse: Int = 0,
 ) {
-    val displayName: String get() = fromName?.takeIf { it.isNotBlank() } ?: "Someone"
+    // The door metaphor is anonymous until the recipient picks up.
+    val displayName: String get() = "Someone"
+    val canRespond: Boolean get() = isRoutableKnockUserId(fromUserId)
 
     /** Peer used to escalate a knock into a real call. */
-    fun toPeer() = CallPeer(userId = fromUserId, displayName = fromName)
+    fun toPeer(): CallPeer? = if (canRespond) {
+        CallPeer(userId = fromUserId, displayName = fromName)
+    } else {
+        null
+    }
 }
 
 /**
@@ -55,6 +61,9 @@ class KnockViewModel(
             signaling.events.collect { event ->
                 if (event.type != "knock") return@collect
                 val from = event.fromUserId ?: return@collect
+                // Privacy-preserving standalone knocks carry a nil UUID. Keep
+                // their live rhythm/sound, but IncomingKnock.canRespond makes
+                // the banner display-only until a durable invitation arrives.
                 _incoming.update { current ->
                     val pulse = (current?.takeIf { it.fromUserId == from }?.pulse ?: 0) + 1
                     IncomingKnock(fromUserId = from, fromName = event.fromName, pulse = pulse)
@@ -89,6 +98,7 @@ class KnockViewModel(
      * The caller is responsible for local sound/haptic feedback.
      */
     fun tap(toUserId: String): Boolean {
+        if (!isRoutableKnockUserId(toUserId)) return false
         val now = System.currentTimeMillis()
         val dt = if (lastTapAt == 0L) 0 else (now - lastTapAt).toInt().coerceIn(0, 60_000)
         lastTapAt = now
@@ -109,3 +119,8 @@ class KnockViewModel(
         const val DISMISS_AFTER_MS = 2_500L
     }
 }
+
+internal const val ANONYMOUS_USER_ID = "00000000-0000-0000-0000-000000000000"
+
+internal fun isRoutableKnockUserId(userId: String): Boolean =
+    userId.isNotBlank() && userId != ANONYMOUS_USER_ID

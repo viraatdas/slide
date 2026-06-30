@@ -39,6 +39,10 @@ npm run start    # serve the production build locally
 ## Deploy (Vercel)
 
 The project is linked to the Vercel project `viraatdas-projects/web`.
+Set `NEXT_PUBLIC_VAPID_PUBLIC_KEY` to the public half of the backend's VAPID
+keypair; a mismatch lets subscription appear successful but makes delivery
+fail. Set `NEXT_PUBLIC_SLIDE_API_BASE_URL` when deploying against a non-default
+API host.
 
 ```bash
 vercel --yes            # preview deploy
@@ -69,7 +73,7 @@ web/
 │       ├── Nav.tsx
 │       ├── Footer.tsx
 │       ├── Reveal.tsx        # IntersectionObserver scroll-reveal
-│       ├── SlideWebApp.tsx   # phone auth, notifications, WS, WebRTC calling
+│       ├── SlideWebApp.tsx   # phone auth, push/signaling, LiveKit calling
 │       ├── StoreBadges.tsx   # thin Web/App Store/Google Play pills
 │       ├── PhoneMockup.tsx   # CSS device frame + Slide UI
 │       ├── Legal.tsx         # shared shell for /privacy and /terms

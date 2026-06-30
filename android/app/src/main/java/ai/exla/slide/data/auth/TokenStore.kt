@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import java.util.UUID
 
 /**
  * Secure, persistent token + identity storage backed by the Android Keystore
@@ -44,6 +45,20 @@ class TokenStore(context: Context) {
         get() = prefs.getString(KEY_NAME, null)
         set(value) = prefs.edit().putString(KEY_NAME, value).apply()
 
+    var pushToken: String?
+        get() = prefs.getString(KEY_PUSH_TOKEN, null)
+        set(value) = prefs.edit().putString(KEY_PUSH_TOKEN, value).apply()
+
+    /** Provider token received before server registration has completed. */
+    var pendingPushToken: String?
+        get() = prefs.getString(KEY_PENDING_PUSH_TOKEN, null)
+        set(value) = prefs.edit().putString(KEY_PENDING_PUSH_TOKEN, value).apply()
+
+    /** Synchronous handoff used by Firebase callbacks before their service returns. */
+    fun persistPendingPushToken(token: String) {
+        prefs.edit().putString(KEY_PENDING_PUSH_TOKEN, token).commit()
+    }
+
     val isLoggedIn: Boolean
         get() = !accessToken.isNullOrEmpty() && !refreshToken.isNullOrEmpty()
 
@@ -54,7 +69,23 @@ class TokenStore(context: Context) {
             .apply()
     }
 
-    fun clear() = prefs.edit().clear().apply()
+    /** Stable URL-safe idempotency identity for this app installation. */
+    val callAcceptKey: String
+        get() = synchronized(prefs) {
+            prefs.getString(KEY_CALL_ACCEPT, null)?.takeIf { it.isNotBlank() }
+                ?: UUID.randomUUID().toString().also { generated ->
+                    prefs.edit().putString(KEY_CALL_ACCEPT, generated).commit()
+                }
+        }
+
+    fun clear() {
+        // Account credentials/tokens are cleared on logout; installation
+        // identity intentionally survives for stable accept retry semantics.
+        val acceptKey = prefs.getString(KEY_CALL_ACCEPT, null)
+        val editor = prefs.edit().clear()
+        if (acceptKey != null) editor.putString(KEY_CALL_ACCEPT, acceptKey)
+        editor.apply()
+    }
 
     companion object {
         private const val KEY_ACCESS = "access_token"
@@ -62,5 +93,8 @@ class TokenStore(context: Context) {
         private const val KEY_USER_ID = "user_id"
         private const val KEY_PHONE = "phone"
         private const val KEY_NAME = "display_name"
+        private const val KEY_PUSH_TOKEN = "push_token"
+        private const val KEY_PENDING_PUSH_TOKEN = "pending_push_token"
+        private const val KEY_CALL_ACCEPT = "call_accept_key"
     }
 }

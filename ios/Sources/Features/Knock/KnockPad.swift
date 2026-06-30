@@ -98,6 +98,10 @@ struct KnockPad: View {
         if startsCall && !didStart {
             didStart = true
             appState.startKnockCall(to: user)
+            // The first physical tap is part of the rhythm too. Starting the
+            // durable knock-call handles closed apps; this live event lets an
+            // already-open recipient feel the exact first beat.
+            appState.sendKnockTap(to: user.id, playLocalFeedback: false)
         } else {
             appState.sendKnockTap(to: user.id)
         }

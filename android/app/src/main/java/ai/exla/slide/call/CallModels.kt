@@ -4,7 +4,7 @@ import ai.exla.slide.data.model.CallSession
 import ai.exla.slide.data.model.User
 
 /** High-level connection state for the in-call UI. */
-enum class CallConnectionState { Idle, Connecting, Connected, Ended, Failed }
+enum class CallConnectionState { Idle, Connecting, Ringing, Connected, Ended, Failed }
 
 /** Lightweight description of who's on the other end of a call. */
 data class CallPeer(
@@ -28,6 +28,8 @@ data class CallUiState(
     val cameraEnabled: Boolean = true,
     val usingFrontCamera: Boolean = true,
     val remoteVideoActive: Boolean = false,
+    /** True only after another LiveKit participant is present in the room. */
+    val remoteParticipantPresent: Boolean = false,
     val isIncoming: Boolean = false,
     val ringStyle: String = "call",
     /** Audio-only → centered avatar layout on white. */

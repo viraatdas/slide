@@ -2,6 +2,7 @@
 
 use axum::{
     extract::{Multipart, State},
+    http::StatusCode,
     Json,
 };
 use serde::Deserialize;
@@ -123,9 +124,8 @@ pub async fn register_device(
     AuthUser(uid): AuthUser,
     Json(body): Json<DeviceBody>,
 ) -> AppResult<Json<Device>> {
-    if body.push_token.trim().is_empty() {
-        return Err(AppError::validation("pushToken required"));
-    }
+    validate_native_token(&body.push_token, body.platform)?;
+    let mut tx = state.db.begin().await?;
     let device: Device = sqlx::query_as(
         "INSERT INTO devices (user_id, push_token, platform, app_version)
          VALUES ($1, $2, $3, $4)
@@ -140,8 +140,33 @@ pub async fn register_device(
     .bind(&body.push_token)
     .bind(body.platform)
     .bind(&body.app_version)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
+
+    // Backward compatibility for released Android clients: they registered
+    // their FCM token through /devices before /push/register existed. Delivery
+    // reads push_subscriptions, so mirror Android tokens here or those installs
+    // can never receive a background call. iOS /devices tokens are ambiguous
+    // (standard APNs vs PushKit) and are deliberately not guessed.
+    if matches!(body.platform, Platform::Android) {
+        sqlx::query(
+            "INSERT INTO push_subscriptions (user_id, kind, token, app_version)
+             VALUES ($1, 'fcm', $2, $3)
+             ON CONFLICT (token)
+             DO UPDATE SET user_id = EXCLUDED.user_id,
+                           kind = EXCLUDED.kind,
+                           p256dh = NULL,
+                           auth = NULL,
+                           app_version = EXCLUDED.app_version,
+                           updated_at = now()",
+        )
+        .bind(uid)
+        .bind(&body.push_token)
+        .bind(&body.app_version)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(Json(device))
 }
 
@@ -165,7 +190,7 @@ pub struct PushRegisterBody {
     pub app_version: String,
 }
 
-/// POST /push/register — upsert a push subscription by (user_id, token).
+/// POST /push/register — transfer/upsert a globally owned push endpoint.
 ///
 /// Separate from POST /devices: subscriptions live in `push_subscriptions`,
 /// which does not use the `platform` enum, so Web Push works without an enum
@@ -175,27 +200,26 @@ pub async fn register_push(
     AuthUser(uid): AuthUser,
     Json(body): Json<PushRegisterBody>,
 ) -> AppResult<Json<Value>> {
-    if body.push_token.trim().is_empty() {
-        return Err(AppError::validation("pushToken required"));
-    }
     let kind = body.kind.trim();
     if !matches!(kind, "apns" | "apns_voip" | "fcm" | "webpush") {
         return Err(AppError::validation(
             "kind must be one of apns|apns_voip|fcm|webpush",
         ));
     }
-    if kind == "webpush" && (body.p256dh.is_none() || body.auth.is_none()) {
-        return Err(AppError::validation(
-            "webpush requires p256dh and auth keys",
-        ));
-    }
+    validate_push_subscription(
+        kind,
+        &body.push_token,
+        body.p256dh.as_deref(),
+        body.auth.as_deref(),
+    )?;
     let _ = &body.platform; // accepted for client convenience; not persisted.
 
     sqlx::query(
         "INSERT INTO push_subscriptions (user_id, kind, token, p256dh, auth, app_version)
          VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (user_id, token)
-         DO UPDATE SET kind = EXCLUDED.kind,
+         ON CONFLICT (token)
+         DO UPDATE SET user_id = EXCLUDED.user_id,
+                       kind = EXCLUDED.kind,
                        p256dh = EXCLUDED.p256dh,
                        auth = EXCLUDED.auth,
                        app_version = EXCLUDED.app_version,
@@ -211,4 +235,137 @@ pub async fn register_push(
     .await?;
 
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushUnregisterBody {
+    pub push_token: String,
+}
+
+/// DELETE /push/register — detach one installation on logout/token rotation.
+/// Ownership is checked so one account cannot unregister another's endpoint.
+pub async fn unregister_push(
+    State(state): State<AppState>,
+    AuthUser(uid): AuthUser,
+    Json(body): Json<PushUnregisterBody>,
+) -> AppResult<StatusCode> {
+    if body.push_token.trim().is_empty() || body.push_token.len() > 4096 {
+        return Err(AppError::validation("valid pushToken required"));
+    }
+
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM push_subscriptions WHERE user_id = $1 AND token = $2")
+        .bind(uid)
+        .bind(&body.push_token)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM devices WHERE user_id = $1 AND push_token = $2")
+        .bind(uid)
+        .bind(&body.push_token)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_native_token(token: &str, platform: Platform) -> AppResult<()> {
+    let token = token.trim();
+    if token.is_empty() || token.len() > 4096 || token.chars().any(char::is_whitespace) {
+        return Err(AppError::validation("invalid pushToken"));
+    }
+    if matches!(platform, Platform::Ios)
+        && (token.len() < 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(AppError::validation("invalid iOS pushToken"));
+    }
+    Ok(())
+}
+
+fn validate_push_subscription(
+    kind: &str,
+    token: &str,
+    p256dh: Option<&str>,
+    auth: Option<&str>,
+) -> AppResult<()> {
+    match kind {
+        "apns" | "apns_voip" => validate_native_token(token, Platform::Ios),
+        "fcm" => validate_native_token(token, Platform::Android),
+        "webpush" => {
+            let endpoint = reqwest::Url::parse(token)
+                .map_err(|_| AppError::validation("invalid webpush endpoint"))?;
+            let host = endpoint
+                .host_str()
+                .ok_or_else(|| AppError::validation("invalid webpush endpoint"))?;
+            let local_host = host.eq_ignore_ascii_case("localhost")
+                || host.ends_with(".localhost")
+                || host.parse::<std::net::IpAddr>().is_ok();
+            let known_push_service = host.eq_ignore_ascii_case("fcm.googleapis.com")
+                || host.ends_with(".push.services.mozilla.com")
+                || host.eq_ignore_ascii_case("web.push.apple.com")
+                || host.ends_with(".notify.windows.com");
+            if endpoint.scheme() != "https"
+                || endpoint.username() != ""
+                || endpoint.password().is_some()
+                || local_host
+                || !known_push_service
+                || token.len() > 4096
+            {
+                return Err(AppError::validation("invalid webpush endpoint"));
+            }
+            let valid_key = |value: &str, min: usize, max: usize| {
+                (min..=max).contains(&value.len())
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'='))
+            };
+            if !p256dh.is_some_and(|v| valid_key(v, 32, 256))
+                || !auth.is_some_and(|v| valid_key(v, 8, 128))
+            {
+                return Err(AppError::validation(
+                    "webpush requires valid p256dh and auth keys",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(AppError::validation("invalid push kind")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use slide_core::models::Platform;
+
+    use super::{validate_native_token, validate_push_subscription};
+
+    #[test]
+    fn rejects_path_injection_in_apns_token() {
+        assert!(validate_native_token("abc/../../device", Platform::Ios).is_err());
+    }
+
+    #[test]
+    fn rejects_local_webpush_endpoint() {
+        let key = "A".repeat(87);
+        let auth = "B".repeat(22);
+        assert!(validate_push_subscription(
+            "webpush",
+            "https://127.0.0.1/internal",
+            Some(&key),
+            Some(&auth)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_provider_shaped_tokens() {
+        assert!(validate_push_subscription("fcm", "fcm-token:abc_123", None, None).is_ok());
+        assert!(validate_push_subscription("apns_voip", &"a".repeat(64), None, None).is_ok());
+        assert!(validate_push_subscription(
+            "webpush",
+            "https://fcm.googleapis.com/fcm/send/example",
+            Some(&"A".repeat(87)),
+            Some(&"B".repeat(22))
+        )
+        .is_ok());
+    }
 }

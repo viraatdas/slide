@@ -18,6 +18,31 @@ if (googleServicesJson.exists()) {
     apply(plugin = libs.plugins.google.services.get().pluginId)
 }
 
+// A debug build remains useful before Firebase is configured, but a release
+// without this file can never receive closed-app calls. Refuse to create a
+// silently broken production artifact.
+val releaseRequested = gradle.startParameter.taskNames.any {
+    it.contains("release", ignoreCase = true)
+}
+if (releaseRequested && !googleServicesJson.exists()) {
+    throw GradleException(
+        "Release builds require android/app/google-services.json. " +
+            "Register app.slide in Firebase and add the downloaded config; " +
+            "without it FCM and background incoming calls are disabled."
+    )
+}
+gradle.taskGraph.whenReady {
+    val containsReleaseArtifact = allTasks.any { task ->
+        task.project == project && task.name.contains("release", ignoreCase = true)
+    }
+    if (containsReleaseArtifact && !googleServicesJson.exists()) {
+        throw GradleException(
+            "Release task graph includes :app release work, but " +
+                "android/app/google-services.json is missing. FCM is required."
+        )
+    }
+}
+
 // Optional release signing config from keystore.properties (gitignored).
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
@@ -39,6 +64,7 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
+        manifestPlaceholders["usesCleartextTraffic"] = "false"
 
         // 10.0.2.2 maps to the host machine's localhost from the emulator.
         buildConfigField("String", "API_BASE_URL", "\"http://10.0.2.2:8080/v1\"")
@@ -60,6 +86,9 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             isDebuggable = true
+            // Local emulator development targets http://10.0.2.2. Production
+            // uses HTTPS/WSS and must never permit accidental cleartext calls.
+            manifestPlaceholders["usesCleartextTraffic"] = "true"
         }
         release {
             // Production backend: slide-api on Fly (REST + signaling WS). NOT
@@ -145,4 +174,6 @@ dependencies {
     // google-services plugin are in place (see conditional apply above).
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.messaging)
+
+    testImplementation("junit:junit:4.13.2")
 }

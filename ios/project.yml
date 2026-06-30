@@ -22,7 +22,9 @@ settings:
 packages:
   LiveKit:
     url: https://github.com/livekit/client-sdk-swift
-    minVersion: "2.0.0"
+    # 2.13 exposes CallKit-coordinated audio engine availability. Older SDKs
+    # can start WebRTC audio before CXProvider activates AVAudioSession.
+    minVersion: "2.13.0"
     maxVersion: "3.0.0"
   Firebase:
     url: https://github.com/firebase/firebase-ios-sdk

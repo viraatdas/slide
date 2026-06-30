@@ -43,6 +43,37 @@ async fn main() -> anyhow::Result<()> {
             cfg.sms_provider
         );
     }
+    let any_livekit_config = !cfg.livekit_url.is_empty()
+        || !cfg.livekit_api_key.is_empty()
+        || !cfg.livekit_api_secret.is_empty();
+    if any_livekit_config
+        && (cfg.livekit_url.is_empty()
+            || cfg.livekit_api_key.is_empty()
+            || cfg.livekit_api_secret.is_empty())
+    {
+        anyhow::bail!(
+            "LiveKit is partially configured; set LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET"
+        );
+    }
+    if !any_livekit_config {
+        tracing::error!(
+            "LiveKit is disabled; maintained mobile/web clients cannot connect media (legacy SFU fallback only)"
+        );
+    }
+    let apns_credentials_present =
+        !cfg.apns_key_id.is_empty() || !cfg.apns_team_id.is_empty() || !cfg.apns_key_p8.is_empty();
+    if apns_credentials_present
+        && (cfg.apns_key_id.is_empty()
+            || cfg.apns_team_id.is_empty()
+            || cfg.apns_key_p8.is_empty()
+            || cfg.apns_topic.is_empty()
+            || cfg.apns_alert_topic.is_empty())
+    {
+        anyhow::bail!("APNs is partially configured; set credentials and non-empty APNS topics");
+    }
+    if apns_credentials_present && !matches!(cfg.apns_env.as_str(), "sandbox" | "prod") {
+        anyhow::bail!("APNS_ENV must be sandbox or prod");
+    }
 
     // ── Postgres ──
     let db = PgPoolOptions::new()
@@ -70,6 +101,13 @@ async fn main() -> anyhow::Result<()> {
     let bind = cfg.api_bind.clone();
     let state = AppState::new(cfg, db, redis, sms, hub);
     tracing::info!(providers = %state.push.enabled_summary(), "push notifications");
+    if !state.push.any_enabled() {
+        tracing::error!(
+            "all push providers are disabled; closed/backgrounded apps cannot receive calls"
+        );
+    }
+
+    tokio::spawn(routes::calls::run_call_expirer(state.clone()));
 
     let app = routes::router(state)
         .layer(TraceLayer::new_for_http())

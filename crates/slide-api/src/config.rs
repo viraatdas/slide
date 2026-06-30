@@ -11,6 +11,9 @@ pub struct Config {
     pub access_ttl_secs: i64,
     pub refresh_ttl_secs: i64,
     pub join_ttl_secs: i64,
+    /// Maximum time a call may remain unanswered before the durable sweeper
+    /// marks it missed and emits terminal events.
+    pub call_ring_timeout_secs: i64,
 
     pub otp_ttl_secs: i64,
     pub otp_max_attempts: i64,
@@ -110,6 +113,7 @@ impl Config {
             access_ttl_secs: var_i64("ACCESS_TOKEN_TTL_SECS", 900),
             refresh_ttl_secs: var_i64("REFRESH_TOKEN_TTL_SECS", 5_184_000),
             join_ttl_secs: var_i64("JOIN_TOKEN_TTL_SECS", 300),
+            call_ring_timeout_secs: var_i64("CALL_RING_TIMEOUT_SECS", 45).clamp(10, 120),
 
             otp_ttl_secs: var_i64("OTP_TTL_SECS", 300),
             otp_max_attempts: var_i64("OTP_MAX_ATTEMPTS", 5),
@@ -150,9 +154,9 @@ impl Config {
             apns_key_id: var("APNS_KEY_ID", ""),
             apns_team_id: var("APNS_TEAM_ID", ""),
             apns_key_p8: var("APNS_KEY_P8", ""),
-            apns_topic: var("APNS_TOPIC", ""),
+            apns_topic: var("APNS_TOPIC", "app.exla.slide.voip"),
             apns_alert_topic: {
-                let topic = var("APNS_TOPIC", "");
+                let topic = var("APNS_TOPIC", "app.exla.slide.voip");
                 var(
                     "APNS_ALERT_TOPIC",
                     topic.strip_suffix(".voip").unwrap_or(&topic),

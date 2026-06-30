@@ -113,6 +113,19 @@ User and onboarding:
 | POST | `/me/avatar` | multipart `file` | `{ "avatarUrl" }` |
 | POST | `/devices` | `{ "pushToken", "platform", "appVersion" }` | `Device` |
 
+Push subscriptions:
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| POST | `/push/register` | `{ "pushToken", "kind": "apns"|"apns_voip"|"fcm"|"webpush", "p256dh"?, "auth"?, "platform"?, "appVersion"? }` | `{ "ok": true }` |
+| DELETE | `/push/register` | `{ "pushToken" }` | `204` |
+
+Push tokens identify an installation, not an account. Registration transfers a
+token to the current user, and clients must unregister their tokens before
+logout or when the OS invalidates them. `POST /devices` also mirrors Android
+tokens into FCM subscriptions for compatibility with already-released clients;
+new native clients should register through `/push/register` directly.
+
 Contacts:
 
 | Method | Path | Body | Returns |
@@ -133,10 +146,10 @@ Calls:
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| POST | `/calls` | `{ "type": "one_to_one"|"group", "participantUserIds": [], "videoEnabled"?: true, "ringStyle"?: "call"|"knock" }` | `{ "call", "joinToken", "sfuUrl", "iceServers" }` |
-| POST | `/calls/:id/accept` | none | `{ "call", "joinToken", "sfuUrl", "iceServers" }` |
+| POST | `/calls` | `{ "type": "one_to_one"|"group", "participantUserIds": [], "videoEnabled"?: true, "ringStyle"?: "call"|"knock" }` (`knock` is one-to-one only) | `{ "call", "joinToken", "sfuUrl", "iceServers" }` |
+| POST | `/calls/:id/accept` | none; header `X-Call-Accept-Key: <stable-install-id>` | `{ "call", "joinToken", "sfuUrl", "iceServers" }` |
 | POST | `/calls/:id/decline` | none | `204` |
-| POST | `/calls/:id/leave` | none | `204` |
+| POST | `/calls/:id/leave` | none; header `X-Call-Accept-Key` on maintained clients | `204` |
 | GET | `/calls?cursor=` | none | `{ "calls": [Call], "nextCursor"? }` |
 
 Realtime plane A, app signaling: `GET /v1/ws?token=<accessToken>`.
@@ -144,16 +157,54 @@ Realtime plane A, app signaling: `GET /v1/ws?token=<accessToken>`.
 Server to client events: `incoming_call`, `call_accepted`, `call_declined`,
 `call_ended`, `participant_joined`, `participant_left`, `presence_update`.
 `incoming_call` includes `callId`, `callType`, `fromUserId`, `fromName`,
-`videoEnabled`, `ringStyle`, `knock`, and `call`.
+`videoEnabled`, `ringStyle`, `knock`, `expiresAt` (Unix epoch milliseconds),
+and, for normal calls, `call`. Pre-answer knock delivery uses a nil caller id,
+the name `Someone`, and omits the full call view; `/accept` returns the revealed
+identity. Clients must discard invitations whose `expiresAt` is in the past.
 
 Client to server events: `presence_ping`, `heartbeat`, `knock`.
 
-`ringStyle` defaults to `call`. `ringStyle: "knock"` is still a real call
+`ringStyle` defaults to `call`. `ringStyle: "knock"` is one-to-one only and is
+still a real call
 invitation: it creates a `calls` row, sends an `incoming_call` event/push with
 `knock: true`, and is answered through `/calls/:id/accept`. The WebSocket
 `knock` event is only the live tap rhythm for already-open apps; it must not be
 used as an offline push or CallKit/CallStyle substitute because it has no call
 id or join token.
+
+Incoming-call delivery is intentionally redundant: the server always publishes
+the invitation over the app WebSocket and every registered push transport.
+An apparently live socket is not proof that a suspended app can present a call,
+and one user's devices may be in different lifecycle states. Clients must
+deduplicate both paths by `callId`, reject a different call while already busy,
+and reconcile terminal state through signaling/REST. Unanswered invitations
+expire server-side after `CALL_RING_TIMEOUT_SECS` (45 seconds by default), and
+provider TTLs are bounded by the same deadline so stale calls cannot ring later.
+Knock callers remain anonymous in notifications and incoming surfaces until the
+recipient answers.
+
+For group calls, one member declining emits `participant_left`; it does not
+emit `call_declined`, because released clients treat that event as terminal for
+the entire call. The group ends only when no non-creator participant remains
+ringing or joined.
+
+The first successful accept publishes `call_accepted` to every participant,
+including the accepting user, and sends a collapsed terminal push back to that
+account. The accepting installation treats it as confirmation; sibling
+installations dismiss the matching ringer without calling `/leave` on the
+participant now owned by the answering device.
+
+Maintained clients send a stable, URL-safe `X-Call-Accept-Key` on every accept.
+The first installation atomically claims the participant; retries with the same
+key are idempotent, while a different installation receives `409` and must
+dismiss locally without calling `/leave` on the winning participant.
+The same key scopes `/leave` after a callee has joined, so cleanup from a losing
+sibling installation is a no-op rather than a hangup of the winner's call.
+
+The Postgres-backed sweeper survives API restarts, closes whole unanswered
+calls, and separately expires still-ringing members of active group calls.
+The raw WebSocket `knock` rhythm stays foreground-only and never sends a second
+alert push; its call-style invitation is the sole offline ring.
 
 Models:
 
@@ -245,8 +296,10 @@ Production backend guidance:
   real SMS provider.
 - AWS App Runner is legacy for this app. Its ingress rejected WebSocket upgrades,
   which breaks the `/v1/ws` incoming-call signaling path. Use Fly for the API.
-- The SFU media plane is separate from the API. Set `SFU_PUBLIC_URL` to the
-  deployed SFU WebSocket endpoint and keep TURN settings current.
+- The media plane is separate from the API. Maintained clients require a
+  matching `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET`; an API
+  startup error reports partial configuration. `SFU_PUBLIC_URL` is retained as
+  a legacy-client fallback. Keep LiveKit's UDP/TCP and TURN paths reachable.
 
 Live smoke command:
 

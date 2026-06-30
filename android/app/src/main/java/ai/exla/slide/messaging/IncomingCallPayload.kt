@@ -1,7 +1,13 @@
 package ai.exla.slide.messaging
 
+import ai.exla.slide.call.CallPeer
+import ai.exla.slide.data.model.SignalEnvelope
 import android.content.Intent
 import android.os.Bundle
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Decoded incoming push payload. [type] is "incoming_call" or "knock"; a knock
@@ -15,8 +21,18 @@ data class IncomingCallPayload(
     val callType: String,
     val videoEnabled: Boolean,
     val ringStyle: String,
+    val sentAtMillis: Long = System.currentTimeMillis(),
+    val expiresAtMillis: Long? = null,
 ) {
     val isKnock: Boolean get() = type == "knock" || ringStyle == "knock"
+
+    fun toPeer() = CallPeer(
+        userId = fromUserId,
+        displayName = fromName,
+    )
+
+    fun isStale(nowMillis: Long = System.currentTimeMillis()): Boolean =
+        remainingIncomingRingMs(nowMillis, sentAtMillis, expiresAtMillis) <= 0L
 
     fun putInto(intent: Intent): Intent = intent.apply {
         putExtra(EXTRA_TYPE, type)
@@ -26,6 +42,8 @@ data class IncomingCallPayload(
         putExtra(EXTRA_CALL_TYPE, callType)
         putExtra(EXTRA_VIDEO_ENABLED, videoEnabled)
         putExtra(EXTRA_RING_STYLE, ringStyle)
+        putExtra(EXTRA_SENT_AT, sentAtMillis)
+        expiresAtMillis?.let { putExtra(EXTRA_EXPIRES_AT, it) }
     }
 
     companion object {
@@ -36,6 +54,8 @@ data class IncomingCallPayload(
         const val EXTRA_CALL_TYPE = "ai.exla.slide.push.CALL_TYPE"
         const val EXTRA_VIDEO_ENABLED = "ai.exla.slide.push.VIDEO_ENABLED"
         const val EXTRA_RING_STYLE = "ai.exla.slide.push.RING_STYLE"
+        const val EXTRA_SENT_AT = "ai.exla.slide.push.SENT_AT"
+        const val EXTRA_EXPIRES_AT = "ai.exla.slide.push.EXPIRES_AT"
 
         fun fromExtras(extras: Bundle?): IncomingCallPayload? {
             extras ?: return null
@@ -49,6 +69,38 @@ data class IncomingCallPayload(
                 videoEnabled = extras.videoEnabled(),
                 ringStyle = extras.getString(EXTRA_RING_STYLE)
                     ?: if (extras.getString(EXTRA_TYPE) == "knock") "knock" else "call",
+                sentAtMillis = extras.getLong(EXTRA_SENT_AT, System.currentTimeMillis()),
+                expiresAtMillis = extras.getLong(EXTRA_EXPIRES_AT)
+                    .takeIf { extras.containsKey(EXTRA_EXPIRES_AT) && it > 0L },
+            )
+        }
+
+        fun fromSignal(event: SignalEnvelope): IncomingCallPayload? {
+            if (event.type != "incoming_call") return null
+            val id = event.callId ?: event.call?.id ?: return null
+            val callerId = event.fromUserId
+                ?: (event.from as? JsonPrimitive)?.contentOrNull
+                ?: (event.from as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull
+                ?: event.call?.createdBy
+                ?: return null
+            val name = event.fromName?.cleanDisplayName()
+                ?: (event.from as? JsonObject)?.get("displayName")?.jsonPrimitive?.contentOrNull
+                    ?.cleanDisplayName()
+                ?: (event.from as? JsonObject)?.get("phone")?.jsonPrimitive?.contentOrNull
+                    ?.takeIf { it.isNotBlank() }
+                ?: "Slide"
+            val style = event.ringStyle
+                ?: event.call?.ringStyle
+                ?: if (event.knock == true) "knock" else "call"
+            return IncomingCallPayload(
+                type = "incoming_call",
+                callId = id,
+                fromUserId = callerId,
+                fromName = name,
+                callType = event.callType ?: event.call?.type ?: "one_to_one",
+                videoEnabled = event.videoEnabled ?: event.call?.videoEnabled ?: true,
+                ringStyle = style,
+                expiresAtMillis = event.expiresAt,
             )
         }
 
@@ -70,5 +122,13 @@ internal fun sanitizeCallerName(value: String?, fallback: String = "Slide"): Str
     if (cleaned.isBlank()) return fallback
     if (cleaned.equals("unknown", ignoreCase = true)) return fallback
     if (cleaned.equals("someone", ignoreCase = true)) return fallback
+    return cleaned
+}
+
+private fun String.cleanDisplayName(): String? {
+    val cleaned = trim()
+    if (cleaned.isBlank()) return null
+    if (cleaned.equals("unknown", ignoreCase = true)) return null
+    if (cleaned.equals("someone", ignoreCase = true)) return null
     return cleaned
 }

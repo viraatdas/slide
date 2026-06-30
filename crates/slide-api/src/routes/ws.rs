@@ -35,7 +35,9 @@ pub async fn ws_handler(
             return axum::http::StatusCode::UNAUTHORIZED.into_response_via();
         }
     };
-    ws.on_upgrade(move |socket| handle_socket(socket, state, uid))
+    ws.max_message_size(16 * 1024)
+        .max_frame_size(16 * 1024)
+        .on_upgrade(move |socket| handle_socket(socket, state, uid))
 }
 
 // Tiny helper to turn a status into a Response without pulling in IntoResponse
@@ -50,30 +52,21 @@ impl IntoResponseExt for axum::http::StatusCode {
     }
 }
 
-async fn signaling_display_name(state: &AppState, uid: Uuid) -> String {
-    let user: Option<(Option<String>, String)> =
-        match sqlx::query_as("SELECT display_name, phone FROM users WHERE id = $1")
-            .bind(uid)
-            .fetch_optional(&state.db)
-            .await
-        {
-            Ok(user) => user,
-            Err(err) => {
-                tracing::warn!(user = %uid, error = %err, "ws: failed to load display name");
-                None
-            }
-        };
-    user.as_ref()
-        .and_then(|(name, _)| name.as_ref())
-        .map(|name| name.trim())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .or_else(|| user.as_ref().map(|(_, phone)| phone.clone()))
-        .unwrap_or_else(|| "Slide".to_string())
+fn anonymous_knock_event(seq: Option<u64>, dt: Option<u64>) -> Value {
+    json!({
+        "type": "knock",
+        // A nil UUID preserves the released wire shape without exposing an id
+        // that the recipient can resolve through its contacts before answer.
+        "fromUserId": Uuid::nil(),
+        "fromName": crate::routes::calls::ANONYMOUS_CALLER_NAME,
+        "seq": seq,
+        "dt": dt,
+    })
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState, uid: Uuid) {
     use futures::{SinkExt, StreamExt};
+    use std::time::Duration;
 
     let (mut sender, mut receiver) = socket.split();
     let (conn_id, mut rx) = state.hub.connect(uid).await;
@@ -84,10 +77,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, uid: Uuid) {
         .execute(&state.db)
         .await;
 
-    let from_name = signaling_display_name(&state, uid).await;
-
     // Outbound pump: hub events → socket.
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         while let Some(evt) = rx.recv().await {
             let txt = evt.to_string();
             if sender.send(Message::Text(txt.into())).await.is_err() {
@@ -98,16 +89,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, uid: Uuid) {
 
     // Inbound pump: handle client → server messages (heartbeat, presence_ping).
     let state_in = state.clone();
-    let from_name_in = from_name.clone();
-    let recv_task = tokio::spawn(async move {
-        // Throttle offline-knock pushes: a knock burst is many taps, but an
-        // offline target should get ONE push per burst, not one per tap.
-        let mut last_knock_push: Option<(Uuid, std::time::Instant)> = None;
-        while let Some(Ok(msg)) = receiver.next().await {
-            // Any inbound frame proves THIS user's app is awake. (A suspended
-            // iOS app keeps its socket open but goes silent — see the
-            // stale-socket check in the knock branch below.)
-            state_in.hub.touch(uid).await;
+    let mut recv_task = tokio::spawn(async move {
+        loop {
+            // Native clients heartbeat every 25s. Retire sockets that stop
+            // speaking instead of treating an iOS-suspended TCP connection as
+            // presence forever. Foreground clients reconnect automatically.
+            let next = tokio::time::timeout(Duration::from_secs(90), receiver.next()).await;
+            let Some(Ok(msg)) = next.ok().flatten() else {
+                break;
+            };
             match msg {
                 Message::Text(t) => {
                     if let Ok(v) = serde_json::from_str::<Value>(&t) {
@@ -125,71 +115,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, uid: Uuid) {
                             // arrival timing of these messages (plus an optional
                             // `dt` for jitter-smoothed playback). No DB, no call
                             // row — a knock is a lightweight presence ping you
-                            // can feel. `fromName` is supplied by the sender so
-                            // the callee can label it without a lookup.
+                            // can feel. Sender identity stays masked; the real
+                            // call invitation reveals it only after acceptance.
                             Some("knock") => {
                                 if let Some(to) = v
                                     .get("to")
                                     .and_then(|x| x.as_str())
                                     .and_then(|s| Uuid::parse_str(s).ok())
+                                    .filter(|target| *target != uid)
                                 {
-                                    let out = json!({
-                                        "type": "knock",
-                                        "fromUserId": uid,
-                                        "fromName": from_name_in.clone(),
-                                        "seq": v.get("seq"),
-                                        "dt": v.get("dt"),
-                                        "strength": v.get("strength"),
-                                        "final": v.get("final"),
-                                        "pattern": v.get("pattern"),
-                                    });
-                                    let delivered = state_in.hub.publish(to, out).await;
+                                    if !state_in.hub.allow_knock(uid).await {
+                                        tracing::debug!(user = %uid, "dropping rate-limited knock");
+                                        continue;
+                                    }
+                                    let seq = v.get("seq").and_then(Value::as_u64);
+                                    let dt = v
+                                        .get("dt")
+                                        .and_then(Value::as_u64)
+                                        .map(|millis| millis.min(10_000));
+                                    let out = anonymous_knock_event(seq, dt);
+                                    state_in.hub.publish(to, out).await;
                                     // The tap rhythm is live-only. Closed-app
                                     // knock rings are real call invitations
                                     // created through POST /calls with
                                     // ringStyle="knock", so they have a call id
                                     // and can be reported through CallKit/Telecom.
-                                    let fresh_burst = last_knock_push
-                                        .map(|(t, at)| t != to || at.elapsed().as_secs() >= 4)
-                                        .unwrap_or(true);
-                                    // delivered > 0 can be a lie: iOS suspends
-                                    // apps without closing the socket, so for
-                                    // ~30-60s after backgrounding the target's
-                                    // socket accepts writes nobody will see.
-                                    // Treat the target as unreachable when it
-                                    // hasn't sent US anything for 45s (heartbeats come every 25s).
-                                    let target_stale = state_in
-                                        .hub
-                                        .last_activity(to)
-                                        .await
-                                        .map(|at| at.elapsed().as_secs() >= 45)
-                                        .unwrap_or(true);
-                                    if (delivered == 0 || target_stale) && fresh_burst {
-                                        last_knock_push = Some((to, std::time::Instant::now()));
-                                        tracing::info!(
-                                            target = %to,
-                                            delivered,
-                                            target_stale,
-                                            "live knock target offline/stale — sending alert push"
-                                        );
-                                        // Anonymous on purpose: knocks reveal who
-                                        // knocked only after you answer. Spawned so
-                                        // the WS loop never blocks on APNs.
-                                        let push_state = state_in.clone();
-                                        tokio::spawn(async move {
-                                            push_state
-                                                .push
-                                                .notify_alert(
-                                                    &push_state.db,
-                                                    to,
-                                                    "Knock knock 🚪",
-                                                    "Someone's at your door — open up",
-                                                    Some("knock"),
-                                                    Some("knock.caf"),
-                                                )
-                                                .await;
-                                        });
-                                    }
                                 }
                             }
                             _ => {}
@@ -208,9 +158,25 @@ async fn handle_socket(socket: WebSocket, state: AppState, uid: Uuid) {
 
     // When either side ends, tear down.
     tokio::select! {
-        _ = send_task => {}
-        _ = recv_task => {}
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
     }
 
     state.hub.disconnect(uid, conn_id).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::anonymous_knock_event;
+
+    #[test]
+    fn live_knock_taps_do_not_reveal_sender_identity() {
+        let event = anonymous_knock_event(Some(3), Some(120));
+        assert_eq!(event["fromUserId"], Uuid::nil().to_string());
+        assert_eq!(event["fromName"], "Someone");
+        assert_eq!(event["seq"], 3);
+        assert_eq!(event["dt"], 120);
+    }
 }

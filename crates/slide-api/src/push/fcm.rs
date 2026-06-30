@@ -5,10 +5,11 @@
 //! token endpoint. We send a high-priority **data** message so the client can
 //! ring even when backgrounded.
 //!
-//! Disabled (no-op) unless FCM_SERVICE_ACCOUNT_JSON is set (inline or path).
+//! Disabled unless FCM_SERVICE_ACCOUNT_JSON is set (inline or path); attempted
+//! sends then return a logged delivery error.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,47 @@ use crate::config::Config;
 const SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 /// Refresh the OAuth token a little before its ~1h expiry.
 const TOKEN_LEEWAY_SECS: u64 = 60;
+
+#[derive(Debug)]
+pub enum FcmError {
+    DeadToken(String),
+    Other(String),
+}
+
+impl std::fmt::Display for FcmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeadToken(message) | Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+fn classify_failure(status: reqwest::StatusCode, body: &str) -> FcmError {
+    let message = format!("fcm status {status}: {body}");
+    let unregistered = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|value| json_contains_string(&value, "errorCode", "UNREGISTERED"));
+    if unregistered {
+        FcmError::DeadToken(message)
+    } else {
+        FcmError::Other(message)
+    }
+}
+
+fn json_contains_string(value: &serde_json::Value, key: &str, expected: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.get(key).and_then(serde_json::Value::as_str) == Some(expected)
+                || map
+                    .values()
+                    .any(|child| json_contains_string(child, key, expected))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|child| json_contains_string(child, key, expected)),
+        _ => false,
+    }
+}
 
 #[derive(Clone)]
 pub struct Fcm(Option<Arc<Inner>>);
@@ -93,7 +135,11 @@ impl Fcm {
             cfg.fcm_project_id.clone()
         };
 
-        let http = match reqwest::Client::builder().build() {
+        let http = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "fcm: failed to build http client — FCM disabled");
@@ -115,19 +161,48 @@ impl Fcm {
         self.0.is_some()
     }
 
-    pub async fn send(&self, device_token: &str, payload: &IncomingPush) -> Result<(), String> {
+    /// Prepare the OAuth credential separately so the caller can revalidate
+    /// subscription ownership after a potentially slow token refresh and
+    /// immediately before the provider request.
+    pub async fn prepare_access_token(&self) -> Result<String, FcmError> {
         let Some(inner) = &self.0 else {
-            tracing::debug!("fcm: disabled (no credentials) — skipping");
-            return Ok(());
+            return Err(FcmError::Other(
+                "fcm disabled: missing or invalid credentials".to_string(),
+            ));
         };
+        inner.access_token().await.map_err(FcmError::Other)
+    }
 
-        let access_token = inner.access_token().await?;
+    pub async fn send_prepared(
+        &self,
+        access_token: &str,
+        device_token: &str,
+        payload: &IncomingPush,
+        ttl_secs: u32,
+        collapse_key: Option<&str>,
+    ) -> Result<(), FcmError> {
+        let Some(inner) = &self.0 else {
+            return Err(FcmError::Other(
+                "fcm disabled: missing or invalid credentials".to_string(),
+            ));
+        };
+        let ttl_secs = payload.ttl_secs(ttl_secs);
+        if payload.kind == "incoming_call" && ttl_secs == 0 {
+            return Ok(());
+        }
 
         // FCM `data` values must be strings; data_map() already produces those.
+        let mut android = json!({
+            "priority": "high",
+            "ttl": format!("{ttl_secs}s"),
+        });
+        if let Some(collapse_key) = collapse_key {
+            android["collapse_key"] = json!(collapse_key);
+        }
         let message = json!({
             "message": {
                 "token": device_token,
-                "android": { "priority": "high" },
+                "android": android,
                 "data": payload.data_map(),
             }
         });
@@ -139,18 +214,18 @@ impl Fcm {
         let resp = inner
             .http
             .post(&url)
-            .bearer_auth(&access_token)
+            .bearer_auth(access_token)
             .json(&message)
             .send()
             .await
-            .map_err(|e| format!("fcm request failed: {e}"))?;
+            .map_err(|e| FcmError::Other(format!("fcm request failed: {e}")))?;
 
         let status = resp.status();
         if status.is_success() {
             Ok(())
         } else {
             let txt = resp.text().await.unwrap_or_default();
-            Err(format!("fcm status {status}: {txt}"))
+            Err(classify_failure(status, &txt))
         }
     }
 }
@@ -164,6 +239,16 @@ impl Inner {
                 if now + TOKEN_LEEWAY_SECS < *exp {
                     return Ok(tok.clone());
                 }
+            }
+        }
+
+        // Serialize refreshes and double-check after taking the write lock.
+        // Incoming fanout is concurrent; without this every device would make
+        // its own OAuth token request when the cache is cold or expires.
+        let mut guard = self.cached.write().await;
+        if let Some((token, expires_at)) = guard.as_ref() {
+            if now + TOKEN_LEEWAY_SECS < *expires_at {
+                return Ok(token.clone());
             }
         }
 
@@ -209,7 +294,6 @@ impl Inner {
         } else {
             tok.expires_in
         };
-        let mut guard = self.cached.write().await;
         *guard = Some((tok.access_token.clone(), now + expires_in));
         Ok(tok.access_token)
     }
@@ -233,4 +317,33 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::StatusCode;
+
+    use super::{classify_failure, FcmError};
+
+    #[test]
+    fn recognizes_only_structured_unregistered_token_errors() {
+        let unregistered = r#"{
+          "error": {"status":"NOT_FOUND", "details":[{"errorCode":"UNREGISTERED"}]}
+        }"#;
+        assert!(matches!(
+            classify_failure(StatusCode::NOT_FOUND, unregistered),
+            FcmError::DeadToken(_)
+        ));
+        assert!(matches!(
+            classify_failure(StatusCode::NOT_FOUND, r#"{"error":{"status":"NOT_FOUND"}}"#),
+            FcmError::Other(_)
+        ));
+        assert!(matches!(
+            classify_failure(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"details":[{"errorCode":"INVALID_ARGUMENT"}]}}"#
+            ),
+            FcmError::Other(_)
+        ));
+    }
 }
